@@ -1,5 +1,15 @@
-CasparCG Server
+CasparCG Ember+
 ===============
+
+This branch adds an integrated Ember+ provider directly inside CasparCG Server.
+
+Ember+ documentation:
+
+- [Current Ember+ tree and parameter overview](EMBER_TREE.md)
+- [Ember+ architecture and implementation plan](src/protocol/ember/README.md)
+
+Overview
+--------
 
 Thank you for your interest in CasparCG Server, a professional software used to
 play out and record professional graphics, audio and video to multiple outputs.

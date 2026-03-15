@@ -1,5 +1,7 @@
 # Ember+ Integration Plan
 
+For the current user-facing Ember+ tree and parameter list, see [../../../EMBER_TREE.md](../../../EMBER_TREE.md).
+
 ## Purpose
 
 This document turns the initial Ember+ feasibility analysis into an implementation plan for CasparCG Server.
