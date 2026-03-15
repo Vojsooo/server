@@ -38,6 +38,7 @@
 namespace caspar { namespace env {
 
 std::wstring                 initial;
+std::wstring                 configuration;
 std::wstring                 media;
 std::wstring                 log;
 bool                         log_enabled = true;
@@ -99,8 +100,10 @@ void configure(const std::wstring& filename)
                                << msg_info(L"Configuration file " + fullpath + L" was not found."));
     }
 
+    configuration = boost::filesystem::absolute(fullpath).lexically_normal().wstring();
+
     try {
-        boost::filesystem::wifstream file(fullpath);
+        boost::filesystem::wifstream file(configuration);
         boost::property_tree::read_xml(file,
                                        pt,
                                        boost::property_tree::xml_parser::trim_whitespace |
@@ -134,6 +137,12 @@ void configure(const std::wstring& filename)
 
     ensure_writable(ftemplate);
     ensure_writable(data);
+}
+
+const std::wstring& configuration_file()
+{
+    check_is_configured();
+    return configuration;
 }
 
 const std::wstring& initial_folder()

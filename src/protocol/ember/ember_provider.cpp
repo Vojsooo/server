@@ -30,10 +30,12 @@
 
 #include <boost/algorithm/string.hpp>
 #include <boost/filesystem.hpp>
+#include <boost/filesystem/fstream.hpp>
 
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <set>
@@ -45,6 +47,9 @@ using access_t = libember::glow::Access;
 using parameter_type_t = libember::glow::ParameterType;
 
 constexpr int channels_root_number      = 100;
+constexpr int runtime_root_number       = 2;
+constexpr int runtime_channel_count_param_number = 1;
+constexpr int runtime_state_update_interval_param_number = 2;
 constexpr int play_node_number          = 10;
 constexpr int loadbg_node_number        = 11;
 constexpr int pause_node_number         = 12;
@@ -52,6 +57,9 @@ constexpr int resume_node_number        = 13;
 constexpr int stop_node_number          = 14;
 constexpr int clear_node_number         = 15;
 constexpr int refresh_node_number       = 16;
+constexpr int load_node_number          = 17;
+constexpr int call_node_number          = 18;
+constexpr int callbg_node_number        = 19;
 constexpr int layers_root_node_number   = 40;
 constexpr int layer_state_node_number   = 1;
 constexpr int layer_mixer_node_number   = 2;
@@ -70,11 +78,37 @@ constexpr int clip_direction_param_number   = 11;
 constexpr int clip_execute_param_number     = 12;
 constexpr int clip_last_reply_param_number  = 13;
 constexpr int clip_last_success_param_number = 14;
+constexpr int clip_auto_param_number        = 15;
+constexpr int clip_sting_node_number        = 20;
+
+constexpr int sting_enabled_param_number             = 1;
+constexpr int sting_mask_param_number                = 2;
+constexpr int sting_trigger_param_number             = 3;
+constexpr int sting_overlay_param_number             = 4;
+constexpr int sting_audio_fade_start_param_number    = 5;
+constexpr int sting_audio_fade_duration_param_number = 6;
+
+constexpr int load_layer_param_number        = 1;
+constexpr int load_name_param_number         = 2;
+constexpr int load_loop_param_number         = 3;
+constexpr int load_seek_param_number         = 4;
+constexpr int load_length_param_number       = 5;
+constexpr int load_filter_param_number       = 6;
+constexpr int load_clear404_param_number     = 7;
+constexpr int load_execute_param_number      = 8;
+constexpr int load_last_reply_param_number   = 9;
+constexpr int load_last_success_param_number = 10;
 
 constexpr int action_layer_param_number      = 1;
 constexpr int action_execute_param_number    = 2;
 constexpr int action_last_reply_param_number = 3;
 constexpr int action_last_success_param_number = 4;
+
+constexpr int call_layer_param_number        = 1;
+constexpr int call_arguments_param_number    = 2;
+constexpr int call_execute_param_number      = 3;
+constexpr int call_last_reply_param_number   = 4;
+constexpr int call_last_success_param_number = 5;
 
 constexpr int refresh_execute_param_number   = 1;
 constexpr int refresh_count_param_number     = 2;
@@ -130,6 +164,8 @@ constexpr int layer_mixer_crop_r_pct_param_number     = 41;
 constexpr int layer_mixer_crop_b_pct_param_number     = 42;
 constexpr int layer_mixer_last_param_number           = layer_mixer_crop_b_pct_param_number;
 constexpr int scaled_mixer_factor                 = 1000;
+constexpr long minimum_state_update_interval_ms   = 1;
+constexpr long maximum_state_update_interval_ms   = 60000;
 
 struct live_layer_state
 {
@@ -290,6 +326,26 @@ void add_integer_parameter(libember::glow::GlowNodeBase* parent,
     parameter->setAccess(access);
     parameter->setType(parameter_type_t::Integer);
     parameter->setValue(value);
+}
+
+void add_ranged_integer_parameter(libember::glow::GlowNodeBase* parent,
+                                  int                           number,
+                                  const std::string&           identifier,
+                                  long                          value,
+                                  long                          minimum,
+                                  long                          maximum,
+                                  const std::string&           description,
+                                  access_t                      access = access_t::ReadOnly)
+{
+    auto* parameter = new libember::glow::GlowParameter(parent, number);
+    parameter->setIdentifier(identifier);
+    if (!description.empty())
+        parameter->setDescription(description);
+    parameter->setAccess(access);
+    parameter->setType(parameter_type_t::Integer);
+    parameter->setMinimum(minimum);
+    parameter->setMaximum(maximum);
+    parameter->setValue(std::max(minimum, std::min(value, maximum)));
 }
 
 void add_boolean_parameter(libember::glow::GlowNodeBase* parent,
@@ -709,19 +765,6 @@ std::string monitor_value_to_string(const core::monitor::data_t& value)
     return boost::apply_visitor(visitor(), value);
 }
 
-std::string monitor_values_to_string(const core::monitor::vector_t& values)
-{
-    std::string text;
-
-    for (std::size_t index = 0; index < values.size(); ++index) {
-        if (index > 0)
-            text += ", ";
-        text += monitor_value_to_string(values[index]);
-    }
-
-    return text;
-}
-
 std::string ember_label_from_key(const std::string& key)
 {
     std::string label;
@@ -1008,32 +1051,78 @@ std::string ember_description_from_monitor_path(const std::string& path)
     return description.empty() ? "Value" : description;
 }
 
-void append_flat_monitor_parameters(libember::glow::GlowNodeBase*                     parent,
-                                    const std::map<std::string, core::monitor::vector_t>& entries,
-                                    int                                                   first_child_number = 100)
+std::string monitor_component_label(const std::string& path, std::size_t index, std::size_t count)
+{
+    const auto slash      = path.find_last_of('/');
+    const auto leaf       = boost::to_lower_copy(slash == std::string::npos ? path : path.substr(slash + 1));
+    const auto value_name = "Value" + std::to_string(index + 1);
+
+    if (count == 2) {
+        if (leaf == "time")
+            return index == 0 ? "Current" : "Duration";
+        if (leaf == "clip")
+            return index == 0 ? "Start" : "Duration";
+        if (leaf == "fps")
+            return index == 0 ? "Numerator" : "Denominator";
+        if (leaf == "frame")
+            return index == 0 ? "Current" : "Duration";
+    }
+
+    return value_name;
+}
+
+template <typename Callback>
+void enumerate_flat_monitor_parameters(const std::map<std::string, core::monitor::vector_t>& entries,
+                                       int                                                   first_child_number,
+                                       Callback&&                                            callback)
 {
     int                   child_number = first_child_number;
     std::set<std::string> used_identifiers;
 
     for (const auto& entry : entries) {
-        if (entry.first.empty())
+        if (entry.first.empty() || entry.second.empty())
             continue;
 
-        auto identifier = ember_identifier_from_monitor_path(entry.first);
-        if (!used_identifiers.insert(identifier).second) {
-            const auto base = identifier;
-            int        suffix = 2;
-            do {
-                identifier = base + std::to_string(suffix++);
-            } while (!used_identifiers.insert(identifier).second);
-        }
+        const auto base_identifier  = ember_identifier_from_monitor_path(entry.first);
+        const auto base_description = ember_description_from_monitor_path(entry.first);
+        const auto component_count  = entry.second.size();
 
-        add_string_parameter(parent,
-                             child_number++,
-                             identifier,
-                             monitor_values_to_string(entry.second),
-                             ember_description_from_monitor_path(entry.first));
+        for (std::size_t index = 0; index < component_count; ++index) {
+            auto identifier  = base_identifier;
+            auto description = base_description;
+
+            if (component_count > 1) {
+                const auto component_label = monitor_component_label(entry.first, index, component_count);
+                identifier += component_label;
+                description += " " + component_label;
+            }
+
+            if (!used_identifiers.insert(identifier).second) {
+                const auto base = identifier;
+                int        suffix = 2;
+                do {
+                    identifier = base + std::to_string(suffix++);
+                } while (!used_identifiers.insert(identifier).second);
+            }
+
+            callback(child_number++, identifier, description, entry.second.at(index));
+        }
     }
+}
+
+void append_flat_monitor_parameters(libember::glow::GlowNodeBase*                     parent,
+                                    const std::map<std::string, core::monitor::vector_t>& entries,
+                                    int                                                   first_child_number = 100)
+{
+    enumerate_flat_monitor_parameters(entries,
+                                      first_child_number,
+                                      [&](int child_number,
+                                          const std::string& identifier,
+                                          const std::string& description,
+                                          const core::monitor::data_t& value) {
+                                          add_string_parameter(
+                                              parent, child_number, identifier, monitor_value_to_string(value), description);
+                                      });
 }
 
 const amcp::channel_context* find_channel_context(const spl::shared_ptr<std::vector<amcp::channel_context>>& channels,
@@ -1075,6 +1164,8 @@ void send_live_layer_state_parameter(const IO::client_connection<char>::ptr& cli
             send_qualified_parameter_update(client, path, [&](auto* p) { p->setValue(layer.paused); });
             return;
         case layer_state_frames_left_param_number:
+            if (layer.frames_left < 0)
+                return;
             send_qualified_parameter_update(client, path, [&](auto* p) { p->setValue(static_cast<long>(layer.frames_left)); });
             return;
         default:
@@ -1521,33 +1612,73 @@ std::wstring direction_token(int direction)
     }
 }
 
-std::wstring compose_clip_command(const std::wstring&                         command_name,
-                                  int                                         channel_index,
-                                  const ember_provider::clip_command_state&   state)
+std::wstring compose_layer_action_command(const std::wstring& command_name, int channel_index, int layer);
+
+std::wstring trim_copy(const std::wstring& value)
 {
-    std::wstring command = command_name + L" " + std::to_wstring(channel_index);
-    if (state.layer > 0)
-        command += L"-" + std::to_wstring(state.layer);
+    return boost::trim_copy(value);
+}
 
-    if (!state.file_name.empty()) {
-        command += L" ";
-        command += quote_amcp_token(state.file_name);
+std::wstring compose_sting_arguments(const ember_provider::clip_command_state& state)
+{
+    if (!state.sting_enabled || state.sting_mask.empty())
+        return L"";
 
-        if (state.loop)
-            command += L" LOOP";
+    std::wstring arguments = L"STING (MASK=" + quote_amcp_token(state.sting_mask);
 
-        if (state.seek > 0)
-            command += L" SEEK " + std::to_wstring(state.seek);
+    if (state.sting_trigger_point > 0)
+        arguments += L" trigger_point=" + std::to_wstring(state.sting_trigger_point);
 
-        if (state.length > 0)
-            command += L" LENGTH " + std::to_wstring(state.length);
+    if (!state.sting_overlay.empty())
+        arguments += L" overlay=" + quote_amcp_token(state.sting_overlay);
 
-        if (!state.filter.empty())
-            command += L" FILTER " + quote_amcp_token(state.filter);
+    if (state.sting_audio_fade_start > 0)
+        arguments += L" audio_fade_start=" + std::to_wstring(state.sting_audio_fade_start);
 
-        if (state.clear_on_404)
-            command += L" CLEAR_ON_404";
+    if (state.sting_audio_fade_duration > 0)
+        arguments += L" audio_fade_duration=" + std::to_wstring(state.sting_audio_fade_duration);
 
+    arguments += L")";
+    return arguments;
+}
+
+std::wstring compose_clip_source_arguments(const ember_provider::clip_command_state& state,
+                                           bool                                       include_transition,
+                                           bool                                       include_auto,
+                                           bool                                       include_sting)
+{
+    if (state.file_name.empty())
+        return L"";
+
+    std::wstring command = L" ";
+    command += quote_amcp_token(state.file_name);
+
+    if (state.loop)
+        command += L" LOOP";
+
+    if (state.seek > 0)
+        command += L" SEEK " + std::to_wstring(state.seek);
+
+    if (state.length > 0)
+        command += L" LENGTH " + std::to_wstring(state.length);
+
+    if (!state.filter.empty())
+        command += L" FILTER " + quote_amcp_token(state.filter);
+
+    if (state.clear_on_404)
+        command += L" CLEAR_ON_404";
+
+    if (include_auto && state.auto_play)
+        command += L" AUTO";
+
+    if (include_sting && state.sting_enabled) {
+        const auto sting = compose_sting_arguments(state);
+        if (!sting.empty())
+            command += L" " + sting;
+        return command;
+    }
+
+    if (include_transition) {
         const auto transition = transition_token(state.transition);
         if (!transition.empty() && state.transition_duration > 0) {
             command += L" " + transition + L" " + std::to_wstring(state.transition_duration);
@@ -1560,6 +1691,51 @@ std::wstring compose_clip_command(const std::wstring&                         co
                 command += L" " + direction;
         }
     }
+
+    return command;
+}
+
+std::wstring compose_clip_command(const std::wstring&                       command_name,
+                                  int                                       channel_index,
+                                  const ember_provider::clip_command_state& state)
+{
+    std::wstring command = command_name + L" " + std::to_wstring(channel_index);
+    if (state.layer > 0)
+        command += L"-" + std::to_wstring(state.layer);
+
+    command += compose_clip_source_arguments(state, true, false, false);
+
+    return command;
+}
+
+std::wstring compose_loadbg_command(int channel_index, const ember_provider::clip_command_state& state)
+{
+    std::wstring command = L"LOADBG " + std::to_wstring(channel_index);
+    if (state.layer > 0)
+        command += L"-" + std::to_wstring(state.layer);
+
+    command += compose_clip_source_arguments(state, true, true, true);
+    return command;
+}
+
+std::wstring compose_load_command(int channel_index, const ember_provider::clip_command_state& state)
+{
+    std::wstring command = L"LOAD " + std::to_wstring(channel_index);
+    if (state.layer > 0)
+        command += L"-" + std::to_wstring(state.layer);
+
+    command += compose_clip_source_arguments(state, false, false, false);
+    return command;
+}
+
+std::wstring compose_call_command(const std::wstring&                       command_name,
+                                  int                                       channel_index,
+                                  const ember_provider::call_command_state& state)
+{
+    auto command = compose_layer_action_command(command_name, channel_index, state.layer);
+    const auto arguments = trim_copy(state.arguments);
+    if (!arguments.empty())
+        command += L" " + arguments;
 
     return command;
 }
@@ -1607,6 +1783,133 @@ bool is_execute_request(const libember::glow::Value& value)
             return true;
         default:
             return false;
+    }
+}
+
+long interval_ms_from_value(const libember::glow::Value& value, long default_value)
+{
+    switch (value.type().value()) {
+        case libember::glow::ParameterType::Integer:
+            return static_cast<long>(value.toInteger());
+        case libember::glow::ParameterType::Real:
+            return static_cast<long>(std::llround(value.toReal()));
+        case libember::glow::ParameterType::Boolean:
+            return value.toBoolean() ? default_value : minimum_state_update_interval_ms;
+        case libember::glow::ParameterType::String:
+            try {
+                return static_cast<long>(std::stol(value.toString()));
+            } catch (...) {
+                return default_value;
+            }
+        default:
+            return default_value;
+    }
+}
+
+long clamp_state_update_interval_ms(long interval_ms)
+{
+    return std::max(minimum_state_update_interval_ms, std::min(interval_ms, maximum_state_update_interval_ms));
+}
+
+bool patch_ember_controller_interval(std::string& xml, long interval_ms)
+{
+    const auto xml_lower = boost::to_lower_copy(xml);
+
+    std::size_t search_offset = 0;
+    while (true) {
+        const auto tcp_start = xml_lower.find("<tcp", search_offset);
+        if (tcp_start == std::string::npos)
+            return false;
+
+        const auto tcp_open_end = xml_lower.find('>', tcp_start);
+        const auto tcp_end      = xml_lower.find("</tcp>", tcp_open_end == std::string::npos ? tcp_start : tcp_open_end);
+        if (tcp_open_end == std::string::npos || tcp_end == std::string::npos)
+            return false;
+
+        const auto protocol_start = xml_lower.find("<protocol>", tcp_open_end);
+        if (protocol_start != std::string::npos && protocol_start < tcp_end) {
+            const auto protocol_value_start = protocol_start + std::string("<protocol>").size();
+            const auto protocol_value_end   = xml_lower.find("</protocol>", protocol_value_start);
+            if (protocol_value_end != std::string::npos && protocol_value_end < tcp_end) {
+                const auto protocol_value =
+                    boost::trim_copy(xml.substr(protocol_value_start, protocol_value_end - protocol_value_start));
+                if (boost::iequals(protocol_value, "EMBER_PLUS") || boost::iequals(protocol_value, "EMBER+") ||
+                    boost::iequals(protocol_value, "EMBERPLUS")) {
+                    const auto interval_tag_start = xml_lower.find("<state-update-interval-ms>", protocol_value_end);
+                    if (interval_tag_start != std::string::npos && interval_tag_start < tcp_end) {
+                        const auto interval_value_start =
+                            interval_tag_start + std::string("<state-update-interval-ms>").size();
+                        const auto interval_value_end =
+                            xml_lower.find("</state-update-interval-ms>", interval_value_start);
+                        if (interval_value_end == std::string::npos || interval_value_end > tcp_end)
+                            return false;
+
+                        xml.replace(interval_value_start,
+                                    interval_value_end - interval_value_start,
+                                    std::to_string(interval_ms));
+                        return true;
+                    }
+
+                    const auto protocol_close_end = protocol_value_end + std::string("</protocol>").size();
+                    std::string newline           = "\n";
+                    const auto  line_start        = xml.rfind('\n', protocol_start);
+                    if (line_start != std::string::npos && line_start > 0 && xml[line_start - 1] == '\r')
+                        newline = "\r\n";
+
+                    std::string indent = "            ";
+                    if (line_start != std::string::npos)
+                        indent = xml.substr(line_start + 1, protocol_start - (line_start + 1));
+
+                    xml.insert(protocol_close_end,
+                               newline + indent + "<state-update-interval-ms>" + std::to_string(interval_ms) +
+                                   "</state-update-interval-ms>");
+                    return true;
+                }
+            }
+        }
+
+        search_offset = tcp_end + std::string("</tcp>").size();
+    }
+}
+
+bool persist_state_update_interval_to_config(long interval_ms, std::wstring& error_message)
+{
+    try {
+        const auto config_path = boost::filesystem::path(env::configuration_file());
+        boost::filesystem::ifstream input(config_path, std::ios::in | std::ios::binary);
+        if (!input) {
+            error_message = L"Unable to open configuration file for reading.";
+            return false;
+        }
+
+        const auto xml = std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+        input.close();
+
+        auto patched_xml = xml;
+        if (!patch_ember_controller_interval(patched_xml, interval_ms)) {
+            error_message = L"Unable to locate EMBER_PLUS controller entry in configuration file.";
+            return false;
+        }
+
+        boost::filesystem::ofstream output(config_path, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!output) {
+            error_message = L"Unable to open configuration file for writing.";
+            return false;
+        }
+
+        output.write(patched_xml.data(), static_cast<std::streamsize>(patched_xml.size()));
+        if (!output.good()) {
+            error_message = L"Failed while writing configuration file.";
+            return false;
+        }
+
+        return true;
+    } catch (const std::exception& ex) {
+        error_message = u16(ex.what());
+        return false;
+    } catch (...) {
+        error_message = L"Unknown error while persisting configuration file.";
+        return false;
     }
 }
 
@@ -1801,15 +2104,19 @@ void send_invocation_result(const IO::client_connection<char>::ptr&      client,
 std::string build_directory_response(const spl::shared_ptr<std::vector<amcp::channel_context>>& channels,
                                      const std::shared_ptr<ember_registry>&                     registry,
                                      const ember_command_bridge&                                command_bridge,
+                                     long                                                       state_update_interval_ms,
                                      const live_snapshot_map_t&                                 live_snapshot,
                                      const std::vector<std::wstring>&                           media_clips,
                                      const std::map<int, ember_provider::clip_command_state>&   play_controls,
                                      const std::map<int, ember_provider::clip_command_state>&   loadbg_controls,
+                                     const std::map<int, ember_provider::clip_command_state>&   load_controls,
                                      const std::map<int, ember_provider::layer_command_state>&  pause_controls,
                                      const std::map<int, ember_provider::layer_command_state>&  resume_controls,
                                      const std::map<int, ember_provider::layer_command_state>&  stop_controls,
                                      const std::map<int, ember_provider::clear_command_state>&  clear_controls,
-                                     const std::map<int, ember_provider::refresh_command_state>& refresh_controls)
+                                     const std::map<int, ember_provider::refresh_command_state>& refresh_controls,
+                                     const std::map<int, ember_provider::call_command_state>&   call_controls,
+                                     const std::map<int, ember_provider::call_command_state>&   callbg_controls)
 {
     const auto play_clip_enums  = play_clip_labels(media_clips);
     const auto transition_enums = play_transition_labels();
@@ -1829,7 +2136,19 @@ std::string build_directory_response(const spl::shared_ptr<std::vector<amcp::cha
     runtime->setDescription("CasparCG runtime");
     runtime->setIsOnline(true);
     add_integer_parameter(
-        runtime, 1, "channel_count", static_cast<long>(channels->size()), "Number of configured video channels");
+        runtime,
+        runtime_channel_count_param_number,
+        "channel_count",
+        static_cast<long>(channels->size()),
+        "Number of configured video channels");
+    add_ranged_integer_parameter(runtime,
+                                 runtime_state_update_interval_param_number,
+                                 "state_update_interval_ms",
+                                 state_update_interval_ms,
+                                 minimum_state_update_interval_ms,
+                                 maximum_state_update_interval_ms,
+                                 "StateUpdateIntervalMs",
+                                 access_t::ReadWrite);
 
     auto* compatibility = new libember::glow::GlowNode(root.get(), 5);
     compatibility->setIdentifier("compatibility");
@@ -1855,46 +2174,115 @@ std::string build_directory_response(const spl::shared_ptr<std::vector<amcp::cha
         add_integer_parameter(channel_node, 1, "index", static_cast<long>(index), "Channel index");
         add_string_parameter(channel_node, 2, "format", format_name, "Active video format");
 
-        const auto add_clip_node = [&](int number, const std::string& name, const ember_provider::clip_command_state& state) {
-            auto* node = new libember::glow::GlowNode(channel_node, number);
-            node->setIdentifier(name);
-            node->setDescription(name);
+        const auto add_clip_node =
+            [&](int number,
+                const std::string& name,
+                const ember_provider::clip_command_state& state,
+                bool include_loadbg_features) {
+                auto* node = new libember::glow::GlowNode(channel_node, number);
+                node->setIdentifier(name);
+                node->setDescription(name);
+                node->setIsOnline(true);
+
+                add_integer_parameter(node, clip_layer_param_number, "Layer", state.layer, "Layer", access_t::ReadWrite);
+                add_boolean_parameter(node, clip_loop_param_number, "Loop", state.loop, "Loop", access_t::ReadWrite);
+                add_enum_parameter(node,
+                                   clip_name_param_number,
+                                   "Clip",
+                                   find_clip_index(state.file_name, media_clips),
+                                   play_clip_enums,
+                                   "Clip",
+                                   access_t::ReadWrite);
+                add_integer_parameter(node, clip_seek_param_number, "Seek", state.seek, "Seek", access_t::ReadWrite);
+                add_integer_parameter(node, clip_length_param_number, "Length", state.length, "Length", access_t::ReadWrite);
+                add_string_parameter(node, clip_filter_param_number, "Filter", u8(state.filter), "Filter", access_t::ReadWrite);
+                add_boolean_parameter(
+                    node, clip_clear404_param_number, "Clear404", state.clear_on_404, "Clear404", access_t::ReadWrite);
+                if (include_loadbg_features)
+                    add_boolean_parameter(node, clip_auto_param_number, "Auto", state.auto_play, "Auto", access_t::ReadWrite);
+                add_enum_parameter(node,
+                                   clip_transition_param_number,
+                                   "Transition",
+                                   state.transition,
+                                   transition_enums,
+                                   "Transition",
+                                   access_t::ReadWrite);
+                add_integer_parameter(
+                    node, clip_duration_param_number, "Duration", state.transition_duration, "Duration", access_t::ReadWrite);
+                add_string_parameter(node, clip_tween_param_number, "Tween", u8(state.tween), "Tween", access_t::ReadWrite);
+                add_enum_parameter(node,
+                                   clip_direction_param_number,
+                                   "Direction",
+                                   state.direction,
+                                   direction_enums,
+                                   "Direction",
+                                   access_t::ReadWrite);
+                add_boolean_parameter(node, clip_execute_param_number, "Execute", false, "Execute", access_t::ReadWrite);
+                add_string_parameter(node, clip_last_reply_param_number, "Reply", u8(state.last_reply), "Reply");
+                add_boolean_parameter(node, clip_last_success_param_number, "Success", state.last_success, "Success");
+
+                if (include_loadbg_features) {
+                    auto* sting_node = new libember::glow::GlowNode(node, clip_sting_node_number);
+                    sting_node->setIdentifier("Sting");
+                    sting_node->setDescription("Sting");
+                    sting_node->setIsOnline(true);
+
+                    add_boolean_parameter(
+                        sting_node, sting_enabled_param_number, "Enable", state.sting_enabled, "Enable", access_t::ReadWrite);
+                    add_enum_parameter(sting_node,
+                                       sting_mask_param_number,
+                                       "Mask",
+                                       find_clip_index(state.sting_mask, media_clips),
+                                       play_clip_enums,
+                                       "Mask",
+                                       access_t::ReadWrite);
+                    add_integer_parameter(
+                        sting_node, sting_trigger_param_number, "Trigger", state.sting_trigger_point, "Trigger", access_t::ReadWrite);
+                    add_enum_parameter(sting_node,
+                                       sting_overlay_param_number,
+                                       "Overlay",
+                                       find_clip_index(state.sting_overlay, media_clips),
+                                       play_clip_enums,
+                                       "Overlay",
+                                       access_t::ReadWrite);
+                    add_integer_parameter(sting_node,
+                                          sting_audio_fade_start_param_number,
+                                          "AudioFadeStart",
+                                          state.sting_audio_fade_start,
+                                          "AudioFadeStart",
+                                          access_t::ReadWrite);
+                    add_integer_parameter(sting_node,
+                                          sting_audio_fade_duration_param_number,
+                                          "AudioFadeDuration",
+                                          state.sting_audio_fade_duration,
+                                          "AudioFadeDuration",
+                                          access_t::ReadWrite);
+                }
+            };
+
+        const auto add_load_node = [&](const ember_provider::clip_command_state& state) {
+            auto* node = new libember::glow::GlowNode(channel_node, load_node_number);
+            node->setIdentifier("Load");
+            node->setDescription("Load");
             node->setIsOnline(true);
 
-            add_integer_parameter(node, clip_layer_param_number, "Layer", state.layer, "Layer", access_t::ReadWrite);
-            add_boolean_parameter(node, clip_loop_param_number, "Loop", state.loop, "Loop", access_t::ReadWrite);
+            add_integer_parameter(node, load_layer_param_number, "Layer", state.layer, "Layer", access_t::ReadWrite);
             add_enum_parameter(node,
-                               clip_name_param_number,
+                               load_name_param_number,
                                "Clip",
                                find_clip_index(state.file_name, media_clips),
                                play_clip_enums,
                                "Clip",
                                access_t::ReadWrite);
-            add_integer_parameter(node, clip_seek_param_number, "Seek", state.seek, "Seek", access_t::ReadWrite);
-            add_integer_parameter(node, clip_length_param_number, "Length", state.length, "Length", access_t::ReadWrite);
-            add_string_parameter(node, clip_filter_param_number, "Filter", u8(state.filter), "Filter", access_t::ReadWrite);
+            add_boolean_parameter(node, load_loop_param_number, "Loop", state.loop, "Loop", access_t::ReadWrite);
+            add_integer_parameter(node, load_seek_param_number, "Seek", state.seek, "Seek", access_t::ReadWrite);
+            add_integer_parameter(node, load_length_param_number, "Length", state.length, "Length", access_t::ReadWrite);
+            add_string_parameter(node, load_filter_param_number, "Filter", u8(state.filter), "Filter", access_t::ReadWrite);
             add_boolean_parameter(
-                node, clip_clear404_param_number, "Clear404", state.clear_on_404, "Clear404", access_t::ReadWrite);
-            add_enum_parameter(node,
-                               clip_transition_param_number,
-                               "Transition",
-                               state.transition,
-                               transition_enums,
-                               "Transition",
-                               access_t::ReadWrite);
-            add_integer_parameter(
-                node, clip_duration_param_number, "Duration", state.transition_duration, "Duration", access_t::ReadWrite);
-            add_string_parameter(node, clip_tween_param_number, "Tween", u8(state.tween), "Tween", access_t::ReadWrite);
-            add_enum_parameter(node,
-                               clip_direction_param_number,
-                               "Direction",
-                               state.direction,
-                               direction_enums,
-                               "Direction",
-                               access_t::ReadWrite);
-            add_boolean_parameter(node, clip_execute_param_number, "Execute", false, "Execute", access_t::ReadWrite);
-            add_string_parameter(node, clip_last_reply_param_number, "Reply", u8(state.last_reply), "Reply");
-            add_boolean_parameter(node, clip_last_success_param_number, "Success", state.last_success, "Success");
+                node, load_clear404_param_number, "Clear404", state.clear_on_404, "Clear404", access_t::ReadWrite);
+            add_boolean_parameter(node, load_execute_param_number, "Execute", false, "Execute", access_t::ReadWrite);
+            add_string_parameter(node, load_last_reply_param_number, "Reply", u8(state.last_reply), "Reply");
+            add_boolean_parameter(node, load_last_success_param_number, "Success", state.last_success, "Success");
         };
 
         const auto add_action_node =
@@ -1910,6 +2298,21 @@ std::string build_directory_response(const spl::shared_ptr<std::vector<amcp::cha
                     node, action_execute_param_number, "Execute", false, "Execute", access_t::ReadWrite);
                 add_string_parameter(node, action_last_reply_param_number, "Reply", u8(state.last_reply), "Reply");
                 add_boolean_parameter(node, action_last_success_param_number, "Success", state.last_success, "Success");
+            };
+
+        const auto add_call_node =
+            [&](int number, const std::string& name, const ember_provider::call_command_state& state) {
+                auto* node = new libember::glow::GlowNode(channel_node, number);
+                node->setIdentifier(name);
+                node->setDescription(name);
+                node->setIsOnline(true);
+
+                add_integer_parameter(node, call_layer_param_number, "Layer", state.layer, "Layer", access_t::ReadWrite);
+                add_string_parameter(
+                    node, call_arguments_param_number, "Args", u8(state.arguments), "Args", access_t::ReadWrite);
+                add_boolean_parameter(node, call_execute_param_number, "Execute", false, "Execute", access_t::ReadWrite);
+                add_string_parameter(node, call_last_reply_param_number, "Reply", u8(state.last_reply), "Reply");
+                add_boolean_parameter(node, call_last_success_param_number, "Success", state.last_success, "Success");
             };
 
         const auto add_clear_node = [&](const ember_provider::clear_command_state& state) {
@@ -1933,27 +2336,35 @@ std::string build_directory_response(const spl::shared_ptr<std::vector<amcp::cha
 
             add_boolean_parameter(
                 node, refresh_execute_param_number, "Execute", false, "Execute", access_t::ReadWrite);
-            add_integer_parameter(
-                node, refresh_count_param_number, "Count", static_cast<long>(media_clips.size() > 0 ? media_clips.size() - 1 : 0), "Count");
+            add_integer_parameter(node,
+                                  refresh_count_param_number,
+                                  "Count",
+                                  static_cast<long>(media_clips.size() > 0 ? media_clips.size() - 1 : 0),
+                                  "Count");
             add_string_parameter(node, refresh_last_reply_param_number, "Reply", u8(state.last_reply), "Reply");
             add_boolean_parameter(node, refresh_last_success_param_number, "Success", state.last_success, "Success");
         };
 
         const auto play_it   = play_controls.find(index);
         const auto loadbg_it = loadbg_controls.find(index);
-        add_clip_node(
-            play_node_number,
-            "Play",
-            play_it != play_controls.end() ? play_it->second : ember_provider::clip_command_state());
+        const auto load_it   = load_controls.find(index);
+        add_clip_node(play_node_number,
+                      "Play",
+                      play_it != play_controls.end() ? play_it->second : ember_provider::clip_command_state(),
+                      false);
         add_clip_node(loadbg_node_number,
                       "LoadBg",
-                      loadbg_it != loadbg_controls.end() ? loadbg_it->second : ember_provider::clip_command_state());
+                      loadbg_it != loadbg_controls.end() ? loadbg_it->second : ember_provider::clip_command_state(),
+                      true);
+        add_load_node(load_it != load_controls.end() ? load_it->second : ember_provider::clip_command_state());
 
-        const auto pause_it  = pause_controls.find(index);
-        const auto resume_it = resume_controls.find(index);
-        const auto stop_it   = stop_controls.find(index);
-        const auto clear_it  = clear_controls.find(index);
+        const auto pause_it   = pause_controls.find(index);
+        const auto resume_it  = resume_controls.find(index);
+        const auto stop_it    = stop_controls.find(index);
+        const auto clear_it   = clear_controls.find(index);
         const auto refresh_it = refresh_controls.find(index);
+        const auto call_it    = call_controls.find(index);
+        const auto callbg_it  = callbg_controls.find(index);
 
         add_action_node(
             pause_node_number,
@@ -1970,6 +2381,12 @@ std::string build_directory_response(const spl::shared_ptr<std::vector<amcp::cha
         add_clear_node(clear_it != clear_controls.end() ? clear_it->second : ember_provider::clear_command_state());
         add_refresh_node(
             refresh_it != refresh_controls.end() ? refresh_it->second : ember_provider::refresh_command_state());
+        add_call_node(call_node_number,
+                      "Call",
+                      call_it != call_controls.end() ? call_it->second : ember_provider::call_command_state());
+        add_call_node(callbg_node_number,
+                      "CallBg",
+                      callbg_it != callbg_controls.end() ? callbg_it->second : ember_provider::call_command_state());
 
         auto* layers_node = new libember::glow::GlowNode(channel_node, layers_root_node_number);
         layers_node->setIdentifier("Layers");
@@ -1996,11 +2413,13 @@ std::string build_directory_response(const spl::shared_ptr<std::vector<amcp::cha
                     state_node, layer_state_background_param_number, "Background", u8(live_layer.background), "Background");
                 add_boolean_parameter(
                     state_node, layer_state_paused_param_number, "Paused", live_layer.paused, "Paused");
-                add_integer_parameter(state_node,
-                                      layer_state_frames_left_param_number,
-                                      "FramesLeft",
-                                      static_cast<long>(live_layer.frames_left),
-                                      "FramesLeft");
+                if (live_layer.frames_left >= 0) {
+                    add_integer_parameter(state_node,
+                                          layer_state_frames_left_param_number,
+                                          "FramesLeft",
+                                          static_cast<long>(live_layer.frames_left),
+                                          "FramesLeft");
+                }
                 auto monitor_entries = live_layer.monitor_entries;
                 monitor_entries.erase("foreground/producer");
                 monitor_entries.erase("background/producer");
@@ -2150,21 +2569,26 @@ std::string build_directory_response(const spl::shared_ptr<std::vector<amcp::cha
 
 ember_provider::ember_provider(const spl::shared_ptr<std::vector<amcp::channel_context>>& channels,
                                const std::shared_ptr<amcp::amcp_command_repository>&      amcp_command_repository,
+                               std::chrono::milliseconds                                   monitor_interval,
                                std::shared_ptr<ember_registry>                              registry)
     : channels_(channels)
     , registry_(std::move(registry))
     , command_bridge_(amcp_command_repository)
     , media_clips_(available_play_clips())
+    , monitor_interval_(monitor_interval.count() > 0 ? monitor_interval : std::chrono::milliseconds(1000))
 {
     for (auto& channel : *channels_) {
         const auto index = channel.raw_channel->index();
         play_controls_.emplace(index, clip_command_state());
         loadbg_controls_.emplace(index, clip_command_state());
+        load_controls_.emplace(index, clip_command_state());
         pause_controls_.emplace(index, layer_command_state());
         resume_controls_.emplace(index, layer_command_state());
         stop_controls_.emplace(index, layer_command_state());
         clear_controls_.emplace(index, clear_command_state());
         refresh_controls_.emplace(index, refresh_command_state());
+        call_controls_.emplace(index, call_command_state());
+        callbg_controls_.emplace(index, call_command_state());
     }
 
     monitor_thread_ = std::thread([this] { monitor_layer_changes(); });
@@ -2173,6 +2597,7 @@ ember_provider::ember_provider(const spl::shared_ptr<std::vector<amcp::channel_c
 ember_provider::~ember_provider()
 {
     stop_monitor_ = true;
+    monitor_interval_cv_.notify_all();
     if (monitor_thread_.joinable())
         monitor_thread_.join();
 }
@@ -2231,6 +2656,36 @@ std::vector<IO::client_connection<char>::ptr> ember_provider::active_clients() c
     return clients;
 }
 
+long ember_provider::monitor_interval_ms() const
+{
+    std::lock_guard<std::mutex> lock(monitor_interval_mutex_);
+    return static_cast<long>(monitor_interval_.count());
+}
+
+void ember_provider::set_monitor_interval(std::chrono::milliseconds interval)
+{
+    const auto normalized_interval = interval.count() > 0 ? interval : std::chrono::milliseconds(1000);
+    {
+        std::lock_guard<std::mutex> lock(monitor_interval_mutex_);
+        monitor_interval_         = normalized_interval;
+        monitor_interval_updated_ = true;
+    }
+
+    monitor_interval_cv_.notify_all();
+}
+
+void ember_provider::broadcast_monitor_interval_update(long interval_ms) const
+{
+    const auto path = std::vector<int>{runtime_root_number, runtime_state_update_interval_param_number};
+    for (const auto& client : active_clients()) {
+        send_qualified_parameter_update(client, path, [&](auto* p) {
+            p->setValue(interval_ms);
+            p->setMinimum(minimum_state_update_interval_ms);
+            p->setMaximum(maximum_state_update_interval_ms);
+        });
+    }
+}
+
 void ember_provider::monitor_layer_changes()
 {
     live_snapshot_map_t previous_snapshot;
@@ -2241,7 +2696,19 @@ void ember_provider::monitor_layer_changes()
     }
 
     while (!stop_monitor_) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        {
+            std::unique_lock<std::mutex> lock(monitor_interval_mutex_);
+            monitor_interval_updated_ = false;
+            const auto wait_interval  = monitor_interval_;
+            if (monitor_interval_cv_.wait_for(lock, wait_interval, [this] {
+                    return stop_monitor_.load() || monitor_interval_updated_;
+                })) {
+                if (stop_monitor_)
+                    break;
+
+                continue;
+            }
+        }
 
         const auto clients = active_clients();
         if (clients.empty())
@@ -2305,21 +2772,27 @@ void ember_provider::send_directory_response(const IO::client_connection<char>::
     try {
         std::map<int, clip_command_state>    play_controls;
         std::map<int, clip_command_state>    loadbg_controls;
+        std::map<int, clip_command_state>    load_controls;
         std::map<int, layer_command_state>   pause_controls;
         std::map<int, layer_command_state>   resume_controls;
         std::map<int, layer_command_state>   stop_controls;
         std::map<int, clear_command_state>   clear_controls;
         std::map<int, refresh_command_state> refresh_controls;
+        std::map<int, call_command_state>    call_controls;
+        std::map<int, call_command_state>    callbg_controls;
         std::vector<std::wstring>            media_clips;
         {
             std::lock_guard<std::mutex> lock(clip_commands_mutex_);
             play_controls = play_controls_;
             loadbg_controls = loadbg_controls_;
+            load_controls = load_controls_;
             pause_controls = pause_controls_;
             resume_controls = resume_controls_;
             stop_controls = stop_controls_;
             clear_controls = clear_controls_;
             refresh_controls = refresh_controls_;
+            call_controls = call_controls_;
+            callbg_controls = callbg_controls_;
         }
         {
             std::lock_guard<std::mutex> lock(media_clips_mutex_);
@@ -2327,19 +2800,24 @@ void ember_provider::send_directory_response(const IO::client_connection<char>::
         }
 
         const auto live_snapshot = collect_live_snapshot(channels_);
+        const auto state_update_interval_ms = monitor_interval_ms();
 
         client->send(build_directory_response(channels_,
                                               registry_,
                                               command_bridge_,
+                                              state_update_interval_ms,
                                               live_snapshot,
                                               media_clips,
                                               play_controls,
                                               loadbg_controls,
+                                              load_controls,
                                               pause_controls,
                                               resume_controls,
                                               stop_controls,
                                               clear_controls,
-                                              refresh_controls),
+                                              refresh_controls,
+                                              call_controls,
+                                              callbg_controls),
                      true);
     } catch (...) {
         CASPAR_LOG_CURRENT_EXCEPTION();
@@ -2582,17 +3060,42 @@ bool ember_provider::handle_parameter_write(const std::vector<int>&             
     if (handle_live_layer_mixer_write(path, value, session))
         return true;
 
-    if (path.size() != 4 || path[0] != channels_root_number)
+    if (path.size() == 2 && path[0] == runtime_root_number && path[1] == runtime_state_update_interval_param_number) {
+        const auto current_interval_ms = monitor_interval_ms();
+        const auto requested_interval_ms =
+            clamp_state_update_interval_ms(interval_ms_from_value(value, current_interval_ms));
+
+        std::wstring error_message;
+        {
+            std::lock_guard<std::mutex> lock(configuration_mutex_);
+            if (!persist_state_update_interval_to_config(requested_interval_ms, error_message)) {
+                CASPAR_LOG(error) << L"[ember] Failed to persist Ember+ state update interval to "
+                                  << env::configuration_file() << L": " << error_message;
+
+                send_qualified_parameter_update(session->client(),
+                                                path,
+                                                [&](auto* p) { p->setValue(current_interval_ms); });
+                return true;
+            }
+        }
+
+        set_monitor_interval(std::chrono::milliseconds(requested_interval_ms));
+        broadcast_monitor_interval_update(requested_interval_ms);
+        CASPAR_LOG(info) << L"[ember] Updated Ember+ state update interval to " << requested_interval_ms
+                         << L" ms and persisted it to " << env::configuration_file();
+        return true;
+    }
+
+    if (path.size() < 4 || path[0] != channels_root_number)
         return false;
 
     const auto channel_index = path[1];
-    const auto node_number   = path[2];
-    const auto parameter     = path[3];
     std::vector<std::wstring> media_clips;
     {
         std::lock_guard<std::mutex> lock(media_clips_mutex_);
         media_clips = media_clips_;
     }
+    const auto clip_count = static_cast<long>(media_clips.size() > 0 ? media_clips.size() - 1 : 0);
 
     const auto send_clip_value_update =
         [&](int target_node, const clip_command_state& state, int target_parameter, const std::vector<std::wstring>& clips) {
@@ -2633,6 +3136,10 @@ bool ember_provider::handle_parameter_write(const std::vector<int>&             
                     send_qualified_parameter_update(
                         session->client(), path, [&](auto* p) { p->setValue(state.clear_on_404); });
                     return;
+                case clip_auto_param_number:
+                    send_qualified_parameter_update(
+                        session->client(), path, [&](auto* p) { p->setValue(state.auto_play); });
+                    return;
                 case clip_transition_param_number:
                     send_qualified_parameter_update(
                         session->client(), path, [&](auto* p) { p->setValue(static_cast<long>(state.transition)); });
@@ -2666,6 +3173,108 @@ bool ember_provider::handle_parameter_write(const std::vector<int>&             
             }
         };
 
+    const auto send_sting_value_update =
+        [&](const clip_command_state& state, int target_parameter, const std::vector<std::wstring>& clips) {
+            const auto path = std::vector<int>{
+                channels_root_number, channel_index, loadbg_node_number, clip_sting_node_number, target_parameter};
+
+            switch (target_parameter) {
+                case sting_enabled_param_number:
+                    send_qualified_parameter_update(session->client(), path, [&](auto* p) { p->setValue(state.sting_enabled); });
+                    return;
+                case sting_mask_param_number: {
+                    const auto clip_labels = play_clip_labels(clips);
+                    send_qualified_parameter_update(session->client(), path, [&](auto* p) {
+                        p->setEnumeration(clip_labels.begin(), clip_labels.end());
+                        p->setMinimum(0L);
+                        p->setMaximum(static_cast<long>(clip_labels.size() - 1));
+                        p->setValue(find_clip_index(state.sting_mask, clips));
+                    });
+                    return;
+                }
+                case sting_trigger_param_number:
+                    send_qualified_parameter_update(
+                        session->client(), path, [&](auto* p) { p->setValue(static_cast<long>(state.sting_trigger_point)); });
+                    return;
+                case sting_overlay_param_number: {
+                    const auto clip_labels = play_clip_labels(clips);
+                    send_qualified_parameter_update(session->client(), path, [&](auto* p) {
+                        p->setEnumeration(clip_labels.begin(), clip_labels.end());
+                        p->setMinimum(0L);
+                        p->setMaximum(static_cast<long>(clip_labels.size() - 1));
+                        p->setValue(find_clip_index(state.sting_overlay, clips));
+                    });
+                    return;
+                }
+                case sting_audio_fade_start_param_number:
+                    send_qualified_parameter_update(session->client(),
+                                                    path,
+                                                    [&](auto* p) { p->setValue(static_cast<long>(state.sting_audio_fade_start)); });
+                    return;
+                case sting_audio_fade_duration_param_number:
+                    send_qualified_parameter_update(
+                        session->client(),
+                        path,
+                        [&](auto* p) { p->setValue(static_cast<long>(state.sting_audio_fade_duration)); });
+                    return;
+                default:
+                    return;
+            }
+        };
+
+    const auto send_load_value_update =
+        [&](const clip_command_state& state, int target_parameter, const std::vector<std::wstring>& clips) {
+            const auto path = std::vector<int>{channels_root_number, channel_index, load_node_number, target_parameter};
+
+            switch (target_parameter) {
+                case load_layer_param_number:
+                    send_qualified_parameter_update(
+                        session->client(), path, [&](auto* p) { p->setValue(static_cast<long>(state.layer)); });
+                    return;
+                case load_name_param_number: {
+                    const auto clip_labels = play_clip_labels(clips);
+                    send_qualified_parameter_update(session->client(), path, [&](auto* p) {
+                        p->setEnumeration(clip_labels.begin(), clip_labels.end());
+                        p->setMinimum(0L);
+                        p->setMaximum(static_cast<long>(clip_labels.size() - 1));
+                        p->setValue(find_clip_index(state.file_name, clips));
+                    });
+                    return;
+                }
+                case load_loop_param_number:
+                    send_qualified_parameter_update(session->client(), path, [&](auto* p) { p->setValue(state.loop); });
+                    return;
+                case load_seek_param_number:
+                    send_qualified_parameter_update(
+                        session->client(), path, [&](auto* p) { p->setValue(static_cast<long>(state.seek)); });
+                    return;
+                case load_length_param_number:
+                    send_qualified_parameter_update(
+                        session->client(), path, [&](auto* p) { p->setValue(static_cast<long>(state.length)); });
+                    return;
+                case load_filter_param_number:
+                    send_qualified_parameter_update(session->client(), path, [&](auto* p) { p->setValue(u8(state.filter)); });
+                    return;
+                case load_clear404_param_number:
+                    send_qualified_parameter_update(
+                        session->client(), path, [&](auto* p) { p->setValue(state.clear_on_404); });
+                    return;
+                case load_execute_param_number:
+                    send_qualified_parameter_update(session->client(), path, [&](auto* p) { p->setValue(false); });
+                    return;
+                case load_last_reply_param_number:
+                    send_qualified_parameter_update(
+                        session->client(), path, [&](auto* p) { p->setValue(u8(state.last_reply)); });
+                    return;
+                case load_last_success_param_number:
+                    send_qualified_parameter_update(
+                        session->client(), path, [&](auto* p) { p->setValue(state.last_success); });
+                    return;
+                default:
+                    return;
+            }
+        };
+
     const auto send_action_value_update =
         [&](int target_node, const layer_command_state& state, int target_parameter) {
             const auto path = std::vector<int>{channels_root_number, channel_index, target_node, target_parameter};
@@ -2682,6 +3291,34 @@ bool ember_provider::handle_parameter_write(const std::vector<int>&             
                         session->client(), path, [&](auto* p) { p->setValue(u8(state.last_reply)); });
                     return;
                 case action_last_success_param_number:
+                    send_qualified_parameter_update(
+                        session->client(), path, [&](auto* p) { p->setValue(state.last_success); });
+                    return;
+                default:
+                    return;
+            }
+        };
+
+    const auto send_call_value_update =
+        [&](int target_node, const call_command_state& state, int target_parameter) {
+            const auto path = std::vector<int>{channels_root_number, channel_index, target_node, target_parameter};
+            switch (target_parameter) {
+                case call_layer_param_number:
+                    send_qualified_parameter_update(
+                        session->client(), path, [&](auto* p) { p->setValue(static_cast<long>(state.layer)); });
+                    return;
+                case call_arguments_param_number:
+                    send_qualified_parameter_update(
+                        session->client(), path, [&](auto* p) { p->setValue(u8(state.arguments)); });
+                    return;
+                case call_execute_param_number:
+                    send_qualified_parameter_update(session->client(), path, [&](auto* p) { p->setValue(false); });
+                    return;
+                case call_last_reply_param_number:
+                    send_qualified_parameter_update(
+                        session->client(), path, [&](auto* p) { p->setValue(u8(state.last_reply)); });
+                    return;
+                case call_last_success_param_number:
                     send_qualified_parameter_update(
                         session->client(), path, [&](auto* p) { p->setValue(state.last_success); });
                     return;
@@ -2738,6 +3375,54 @@ bool ember_provider::handle_parameter_write(const std::vector<int>&             
             }
         };
 
+    if (path.size() == 5) {
+        if (path[2] != loadbg_node_number || path[3] != clip_sting_node_number)
+            return false;
+
+        const auto parameter = path[4];
+        clip_command_state state_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(clip_commands_mutex_);
+            auto                        it = loadbg_controls_.find(channel_index);
+            if (it == loadbg_controls_.end())
+                return false;
+
+            switch (parameter) {
+                case sting_enabled_param_number:
+                    it->second.sting_enabled = value_to_bool(value, it->second.sting_enabled);
+                    break;
+                case sting_mask_param_number:
+                    it->second.sting_mask = clip_from_value(value, media_clips);
+                    break;
+                case sting_trigger_param_number:
+                    it->second.sting_trigger_point = std::max(0L, value.toInteger());
+                    break;
+                case sting_overlay_param_number:
+                    it->second.sting_overlay = clip_from_value(value, media_clips);
+                    break;
+                case sting_audio_fade_start_param_number:
+                    it->second.sting_audio_fade_start = std::max(0L, value.toInteger());
+                    break;
+                case sting_audio_fade_duration_param_number:
+                    it->second.sting_audio_fade_duration = std::max(0L, value.toInteger());
+                    break;
+                default:
+                    return false;
+            }
+
+            state_snapshot = it->second;
+        }
+
+        send_sting_value_update(state_snapshot, parameter, media_clips);
+        return true;
+    }
+
+    if (path.size() != 4)
+        return false;
+
+    const auto node_number = path[2];
+    const auto parameter   = path[3];
+
     if (node_number == play_node_number || node_number == loadbg_node_number) {
         clip_command_state state_snapshot;
         {
@@ -2768,6 +3453,11 @@ bool ember_provider::handle_parameter_write(const std::vector<int>&             
                     break;
                 case clip_clear404_param_number:
                     it->second.clear_on_404 = value.toBoolean();
+                    break;
+                case clip_auto_param_number:
+                    if (node_number != loadbg_node_number)
+                        return false;
+                    it->second.auto_play = value_to_bool(value, it->second.auto_play);
                     break;
                 case clip_transition_param_number:
                     it->second.transition = static_cast<int>(enum_index_from_value(value, play_transition_labels()));
@@ -2802,10 +3492,15 @@ bool ember_provider::handle_parameter_write(const std::vector<int>&             
             return true;
         }
 
-        const auto command_name = node_number == play_node_number ? L"PLAY" : L"LOADBG";
-        const auto result =
-            command_bridge_.execute_native_command_line(compose_clip_command(command_name, channel_index, state_snapshot),
-                                                        session);
+        ember_command_bridge::invocation_result result;
+        if (node_number == loadbg_node_number && state_snapshot.sting_enabled && state_snapshot.sting_mask.empty()) {
+            result = {false, L"400 LOADBG STING MASK REQUIRED\r\n"};
+        } else {
+            result = command_bridge_.execute_native_command_line(node_number == play_node_number
+                                                                     ? compose_clip_command(L"PLAY", channel_index, state_snapshot)
+                                                                     : compose_loadbg_command(channel_index, state_snapshot),
+                                                                 session);
+        }
 
         {
             std::lock_guard<std::mutex> lock(clip_commands_mutex_);
@@ -2819,6 +3514,74 @@ bool ember_provider::handle_parameter_write(const std::vector<int>&             
         send_clip_value_update(node_number, state_snapshot, clip_execute_param_number, media_clips);
         send_clip_value_update(node_number, state_snapshot, clip_last_reply_param_number, media_clips);
         send_clip_value_update(node_number, state_snapshot, clip_last_success_param_number, media_clips);
+        return true;
+    }
+
+    if (node_number == load_node_number) {
+        clip_command_state state_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(clip_commands_mutex_);
+            auto                        it = load_controls_.find(channel_index);
+            if (it == load_controls_.end())
+                return false;
+
+            switch (parameter) {
+                case load_layer_param_number:
+                    it->second.layer = std::max(0L, value.toInteger());
+                    break;
+                case load_name_param_number:
+                    it->second.file_name = clip_from_value(value, media_clips);
+                    break;
+                case load_loop_param_number:
+                    it->second.loop = value_to_bool(value, it->second.loop);
+                    break;
+                case load_seek_param_number:
+                    it->second.seek = std::max(0L, value.toInteger());
+                    break;
+                case load_length_param_number:
+                    it->second.length = std::max(0L, value.toInteger());
+                    break;
+                case load_filter_param_number:
+                    it->second.filter = u16(value.toString());
+                    break;
+                case load_clear404_param_number:
+                    it->second.clear_on_404 = value_to_bool(value, it->second.clear_on_404);
+                    break;
+                case load_execute_param_number:
+                case load_last_reply_param_number:
+                case load_last_success_param_number:
+                    break;
+                default:
+                    return false;
+            }
+
+            state_snapshot = it->second;
+        }
+
+        if (parameter != load_execute_param_number) {
+            send_load_value_update(state_snapshot, parameter, media_clips);
+            return true;
+        }
+
+        if (!is_execute_request(value)) {
+            send_load_value_update(state_snapshot, load_execute_param_number, media_clips);
+            return true;
+        }
+
+        const auto result =
+            command_bridge_.execute_native_command_line(compose_load_command(channel_index, state_snapshot), session);
+
+        {
+            std::lock_guard<std::mutex> lock(clip_commands_mutex_);
+            auto&                       state = load_controls_.at(channel_index);
+            state.last_reply                   = result.message;
+            state.last_success                 = result.success;
+            state_snapshot                     = state;
+        }
+
+        send_load_value_update(state_snapshot, load_execute_param_number, media_clips);
+        send_load_value_update(state_snapshot, load_last_reply_param_number, media_clips);
+        send_load_value_update(state_snapshot, load_last_success_param_number, media_clips);
         return true;
     }
 
@@ -2885,6 +3648,70 @@ bool ember_provider::handle_parameter_write(const std::vector<int>&             
         return true;
     }
 
+    if (node_number == call_node_number || node_number == callbg_node_number) {
+        call_command_state state_snapshot;
+        std::map<int, call_command_state>* controls = nullptr;
+        std::wstring                       command_name;
+        if (node_number == call_node_number) {
+            controls = &call_controls_;
+            command_name = L"CALL";
+        } else {
+            controls = &callbg_controls_;
+            command_name = L"CALLBG";
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(clip_commands_mutex_);
+            auto                        it = controls->find(channel_index);
+            if (it == controls->end())
+                return false;
+
+            switch (parameter) {
+                case call_layer_param_number:
+                    it->second.layer = std::max(0L, value.toInteger());
+                    break;
+                case call_arguments_param_number:
+                    it->second.arguments = u16(value.toString());
+                    break;
+                case call_execute_param_number:
+                case call_last_reply_param_number:
+                case call_last_success_param_number:
+                    break;
+                default:
+                    return false;
+            }
+
+            state_snapshot = it->second;
+        }
+
+        if (parameter != call_execute_param_number) {
+            send_call_value_update(node_number, state_snapshot, parameter);
+            return true;
+        }
+
+        if (!is_execute_request(value)) {
+            send_call_value_update(node_number, state_snapshot, call_execute_param_number);
+            return true;
+        }
+
+        const auto result =
+            command_bridge_.execute_native_command_line(compose_call_command(command_name, channel_index, state_snapshot),
+                                                        session);
+
+        {
+            std::lock_guard<std::mutex> lock(clip_commands_mutex_);
+            auto&                       state = controls->at(channel_index);
+            state.last_reply                   = result.message;
+            state.last_success                 = result.success;
+            state_snapshot                     = state;
+        }
+
+        send_call_value_update(node_number, state_snapshot, call_execute_param_number);
+        send_call_value_update(node_number, state_snapshot, call_last_reply_param_number);
+        send_call_value_update(node_number, state_snapshot, call_last_success_param_number);
+        return true;
+    }
+
     if (node_number == clear_node_number) {
         clear_command_state state_snapshot;
         {
@@ -2939,6 +3766,7 @@ bool ember_provider::handle_parameter_write(const std::vector<int>&             
         refresh_command_state refresh_snapshot;
         clip_command_state    play_snapshot;
         clip_command_state    loadbg_snapshot;
+        clip_command_state    load_snapshot;
 
         {
             std::lock_guard<std::mutex> lock(clip_commands_mutex_);
@@ -2949,16 +3777,12 @@ bool ember_provider::handle_parameter_write(const std::vector<int>&             
         }
 
         if (parameter == refresh_count_param_number) {
-            send_refresh_value_update(
-                refresh_snapshot, refresh_count_param_number, static_cast<long>(media_clips.size() > 0 ? media_clips.size() - 1 : 0));
+            send_refresh_value_update(refresh_snapshot, refresh_count_param_number, clip_count);
             return true;
         }
 
         if (parameter == refresh_last_reply_param_number || parameter == refresh_last_success_param_number) {
-            send_refresh_value_update(
-                refresh_snapshot,
-                parameter,
-                static_cast<long>(media_clips.size() > 0 ? media_clips.size() - 1 : 0));
+            send_refresh_value_update(refresh_snapshot, parameter, clip_count);
             return true;
         }
 
@@ -2966,14 +3790,12 @@ bool ember_provider::handle_parameter_write(const std::vector<int>&             
             return false;
 
         if (!is_execute_request(value)) {
-            send_refresh_value_update(
-                refresh_snapshot,
-                refresh_execute_param_number,
-                static_cast<long>(media_clips.size() > 0 ? media_clips.size() - 1 : 0));
+            send_refresh_value_update(refresh_snapshot, refresh_execute_param_number, clip_count);
             return true;
         }
 
         media_clips = available_play_clips();
+        const auto refreshed_clip_count = static_cast<long>(media_clips.size() > 0 ? media_clips.size() - 1 : 0);
         {
             std::lock_guard<std::mutex> lock(media_clips_mutex_);
             media_clips_ = media_clips;
@@ -2986,26 +3808,18 @@ bool ember_provider::handle_parameter_write(const std::vector<int>&             
             refresh_snapshot                         = refresh_state;
             play_snapshot                            = play_controls_.at(channel_index);
             loadbg_snapshot                          = loadbg_controls_.at(channel_index);
+            load_snapshot                            = load_controls_.at(channel_index);
         }
 
-        send_refresh_value_update(
-            refresh_snapshot,
-            refresh_execute_param_number,
-            static_cast<long>(media_clips.size() > 0 ? media_clips.size() - 1 : 0));
-        send_refresh_value_update(
-            refresh_snapshot,
-            refresh_count_param_number,
-            static_cast<long>(media_clips.size() > 0 ? media_clips.size() - 1 : 0));
-        send_refresh_value_update(
-            refresh_snapshot,
-            refresh_last_reply_param_number,
-            static_cast<long>(media_clips.size() > 0 ? media_clips.size() - 1 : 0));
-        send_refresh_value_update(
-            refresh_snapshot,
-            refresh_last_success_param_number,
-            static_cast<long>(media_clips.size() > 0 ? media_clips.size() - 1 : 0));
+        send_refresh_value_update(refresh_snapshot, refresh_execute_param_number, refreshed_clip_count);
+        send_refresh_value_update(refresh_snapshot, refresh_count_param_number, refreshed_clip_count);
+        send_refresh_value_update(refresh_snapshot, refresh_last_reply_param_number, refreshed_clip_count);
+        send_refresh_value_update(refresh_snapshot, refresh_last_success_param_number, refreshed_clip_count);
         send_clip_value_update(play_node_number, play_snapshot, clip_name_param_number, media_clips);
         send_clip_value_update(loadbg_node_number, loadbg_snapshot, clip_name_param_number, media_clips);
+        send_sting_value_update(loadbg_snapshot, sting_mask_param_number, media_clips);
+        send_sting_value_update(loadbg_snapshot, sting_overlay_param_number, media_clips);
+        send_load_value_update(load_snapshot, load_name_param_number, media_clips);
         return true;
     }
 

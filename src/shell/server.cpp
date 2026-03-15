@@ -60,6 +60,8 @@
 #include <boost/format.hpp>
 #include <boost/property_tree/ptree.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <thread>
 #include <utility>
 
@@ -96,6 +98,35 @@ std::shared_ptr<boost::asio::io_context> create_io_context_with_running_service(
         else
             thread->detach();
     });
+}
+
+std::chrono::milliseconds ember_state_update_interval(const boost::property_tree::wptree& pt)
+{
+    using boost::property_tree::wptree;
+
+    constexpr long default_interval_ms = 1000;
+    constexpr long minimum_interval_ms = 1;
+
+    auto controllers = pt.get_child_optional(L"configuration.controllers");
+    if (!controllers)
+        return std::chrono::milliseconds(default_interval_ms);
+
+    for (auto& xml_controller : pt | witerate_children(L"configuration.controllers") | welement_context_iteration) {
+        if (xml_controller.first != L"tcp")
+            continue;
+
+        const auto protocol = xml_controller.second.get(L"protocol", L"");
+        if (!boost::iequals(protocol, L"EMBER_PLUS") && !boost::iequals(protocol, L"EMBER+") &&
+            !boost::iequals(protocol, L"EMBERPLUS")) {
+            continue;
+        }
+
+        const auto interval_ms =
+            std::max(minimum_interval_ms, xml_controller.second.get<long>(L"state-update-interval-ms", default_interval_ms));
+        return std::chrono::milliseconds(interval_ms);
+    }
+
+    return std::chrono::milliseconds(default_interval_ms);
 }
 
 struct server::impl
@@ -141,7 +172,8 @@ struct server::impl
         setup_amcp_command_repo();
         CASPAR_LOG(info) << L"Initialized command repository.";
 
-        ember_provider_ = std::make_shared<ember::ember_provider>(channels_, amcp_command_repo_);
+        ember_provider_ = std::make_shared<ember::ember_provider>(
+            channels_, amcp_command_repo_, ember_state_update_interval(env::properties()));
         CASPAR_LOG(info) << L"Initialized ember provider.";
 
         module_dependencies dependencies(

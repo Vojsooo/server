@@ -20,8 +20,10 @@
 
 #include <common/memory.h>
 
-#include <map>
+#include <chrono>
 #include <atomic>
+#include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -48,10 +50,17 @@ class ember_provider final
         int          length              = 0;
         std::wstring filter;
         bool         clear_on_404        = false;
+        bool         auto_play           = false;
         int          transition          = 0;
         int          transition_duration = 12;
         std::wstring tween;
         int          direction           = 0;
+        bool         sting_enabled       = false;
+        std::wstring sting_mask;
+        int          sting_trigger_point = 0;
+        std::wstring sting_overlay;
+        int          sting_audio_fade_start    = 0;
+        int          sting_audio_fade_duration = 0;
         std::wstring last_reply;
         bool         last_success        = true;
     };
@@ -76,8 +85,17 @@ class ember_provider final
         bool         last_success = true;
     };
 
+    struct call_command_state
+    {
+        int          layer        = 1;
+        std::wstring arguments;
+        std::wstring last_reply;
+        bool         last_success = true;
+    };
+
     explicit ember_provider(const spl::shared_ptr<std::vector<amcp::channel_context>>& channels,
                             const std::shared_ptr<amcp::amcp_command_repository>&      amcp_command_repository,
+                            std::chrono::milliseconds                                   monitor_interval = std::chrono::milliseconds(1000),
                             std::shared_ptr<ember_registry> registry = std::make_shared<ember_registry>());
     ~ember_provider();
 
@@ -90,6 +108,9 @@ class ember_provider final
     void register_session(const std::shared_ptr<ember_session>& session);
     std::vector<IO::client_connection<char>::ptr> active_clients() const;
     void monitor_layer_changes();
+    long monitor_interval_ms() const;
+    void set_monitor_interval(std::chrono::milliseconds interval);
+    void broadcast_monitor_interval_update(long interval_ms) const;
     void broadcast_directory_response() const;
     void send_directory_response(const IO::client_connection<char>::ptr& client) const;
     bool handle_parameter_write(const std::vector<int>&              path,
@@ -104,16 +125,24 @@ class ember_provider final
     mutable std::mutex                                  clip_commands_mutex_;
     std::map<int, clip_command_state>                   play_controls_;
     std::map<int, clip_command_state>                   loadbg_controls_;
+    std::map<int, clip_command_state>                   load_controls_;
     std::map<int, layer_command_state>                  pause_controls_;
     std::map<int, layer_command_state>                  resume_controls_;
     std::map<int, layer_command_state>                  stop_controls_;
     std::map<int, clear_command_state>                  clear_controls_;
     std::map<int, refresh_command_state>                refresh_controls_;
+    std::map<int, call_command_state>                   call_controls_;
+    std::map<int, call_command_state>                   callbg_controls_;
     mutable std::mutex                                  media_clips_mutex_;
     std::vector<std::wstring>                           media_clips_;
     mutable std::mutex                                  sessions_mutex_;
     mutable std::vector<std::weak_ptr<ember_session>>   sessions_;
     std::atomic<bool>                                   stop_monitor_{false};
+    mutable std::mutex                                  monitor_interval_mutex_;
+    std::condition_variable                             monitor_interval_cv_;
+    std::chrono::milliseconds                           monitor_interval_;
+    bool                                                monitor_interval_updated_ = false;
+    mutable std::mutex                                  configuration_mutex_;
     std::thread                                         monitor_thread_;
 };
 

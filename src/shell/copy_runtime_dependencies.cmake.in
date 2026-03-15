@@ -1,0 +1,50 @@
+if (NOT DEFINED CASPARCG_RUNTIME_OUTPUT_DIR OR CASPARCG_RUNTIME_OUTPUT_DIR STREQUAL "")
+    message(FATAL_ERROR "CASPARCG_RUNTIME_OUTPUT_DIR must be provided.")
+endif ()
+
+if (NOT DEFINED CASPARCG_RUNTIME_CONFIGURATION OR CASPARCG_RUNTIME_CONFIGURATION STREQUAL "")
+    if (DEFINED CMAKE_BUILD_TYPE AND NOT CMAKE_BUILD_TYPE STREQUAL "")
+        set(CASPARCG_RUNTIME_CONFIGURATION "${CMAKE_BUILD_TYPE}")
+    else ()
+        set(CASPARCG_RUNTIME_CONFIGURATION "Release")
+    endif ()
+endif ()
+
+set(CASPARCG_RUNTIME_DEPENDENCIES_DEBUG @CASPARCG_RUNTIME_DEPENDENCIES_DEBUG@)
+set(CASPARCG_RUNTIME_DEPENDENCIES_RELEASE @CASPARCG_RUNTIME_DEPENDENCIES_RELEASE@)
+set(CASPARCG_RUNTIME_DEPENDENCIES_DEBUG_DIRS @CASPARCG_RUNTIME_DEPENDENCIES_DEBUG_DIRS@)
+set(CASPARCG_RUNTIME_DEPENDENCIES_RELEASE_DIRS @CASPARCG_RUNTIME_DEPENDENCIES_RELEASE_DIRS@)
+
+if (CASPARCG_RUNTIME_CONFIGURATION STREQUAL "Debug")
+    set(_casparcg_runtime_files ${CASPARCG_RUNTIME_DEPENDENCIES_DEBUG})
+    set(_casparcg_runtime_dirs ${CASPARCG_RUNTIME_DEPENDENCIES_DEBUG_DIRS})
+else ()
+    set(_casparcg_runtime_files ${CASPARCG_RUNTIME_DEPENDENCIES_RELEASE})
+    set(_casparcg_runtime_dirs ${CASPARCG_RUNTIME_DEPENDENCIES_RELEASE_DIRS})
+endif ()
+
+set(_casparcg_destinations "${CASPARCG_RUNTIME_OUTPUT_DIR}")
+if (DEFINED CASPARCG_RUNTIME_MIRROR_DIR AND
+    NOT CASPARCG_RUNTIME_MIRROR_DIR STREQUAL "" AND
+    NOT CASPARCG_RUNTIME_MIRROR_DIR STREQUAL CASPARCG_RUNTIME_OUTPUT_DIR)
+    list(APPEND _casparcg_destinations "${CASPARCG_RUNTIME_MIRROR_DIR}")
+endif ()
+list(REMOVE_DUPLICATES _casparcg_destinations)
+
+foreach (_casparcg_destination ${_casparcg_destinations})
+    file(MAKE_DIRECTORY "${_casparcg_destination}")
+
+    foreach (_casparcg_file ${_casparcg_runtime_files})
+        if (EXISTS "${_casparcg_file}")
+            execute_process(COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${_casparcg_file}" "${_casparcg_destination}/")
+        endif ()
+    endforeach ()
+
+    foreach (_casparcg_dir ${_casparcg_runtime_dirs})
+        if (EXISTS "${_casparcg_dir}")
+            get_filename_component(_casparcg_dir_name "${_casparcg_dir}" NAME)
+            execute_process(
+                COMMAND "${CMAKE_COMMAND}" -E copy_directory "${_casparcg_dir}" "${_casparcg_destination}/${_casparcg_dir_name}/")
+        endif ()
+    endforeach ()
+endforeach ()

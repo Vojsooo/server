@@ -12,3 +12,8 @@ if(MSVC)
     target_compile_options(ember-static PRIVATE /wd4267)
     target_compile_options(ember-shared PRIVATE /wd4267)
 endif()
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(ember-static PRIVATE -Wno-error=maybe-uninitialized -Wno-maybe-uninitialized)
+    target_compile_options(ember-shared PRIVATE -Wno-error=maybe-uninitialized -Wno-maybe-uninitialized)
+endif()
