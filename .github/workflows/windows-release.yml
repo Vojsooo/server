@@ -1,0 +1,109 @@
+name: Release Windows
+
+on:
+    workflow_dispatch:
+        inputs:
+            version:
+                description: "Release tag, for example v0.1.0"
+                required: true
+                type: string
+            title:
+                description: "Release title"
+                required: false
+                default: ""
+                type: string
+            prerelease:
+                description: "Mark this release as a prerelease"
+                required: true
+                default: true
+                type: boolean
+            notes:
+                description: "Optional release notes"
+                required: false
+                default: ""
+                type: string
+
+permissions:
+    contents: write
+
+jobs:
+    build-and-release:
+        runs-on: windows-2022
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Download media-scanner
+              uses: robinraju/release-downloader@v1.10
+              with:
+                  repository: "casparcg/media-scanner"
+                  latest: true
+                  fileName: "*-win32-x64.zip"
+                  tarBall: false
+                  zipBall: false
+                  out-file-path: "media-scanner"
+                  extract: true
+
+            - name: Tidy media-scanner download
+              shell: bash
+              run: |
+                  rm media-scanner/*.zip
+
+            - name: Run build
+              run: |
+                  ./tools/windows/build.bat
+              env:
+                  CI: 1
+                  MEDIA_SCANNER_FOLDER: "..\\media-scanner"
+
+            - name: Rename build
+              id: rename-build
+              shell: bash
+              run: |
+                  TARGET="casparcg-ember-plus-${{ inputs.version }}-windows.zip"
+                  mv dist/casparcg_server.zip "$TARGET"
+                  echo "artifactname=$TARGET" >> "$GITHUB_OUTPUT"
+
+            - name: Upload workflow artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: casparcg-ember-plus-windows
+                  path: ${{ steps.rename-build.outputs.artifactname }}
+
+            - name: Prepare release metadata
+              id: release-meta
+              shell: bash
+              env:
+                  INPUT_TITLE: ${{ inputs.title }}
+                  INPUT_NOTES: ${{ inputs.notes }}
+              run: |
+                  TITLE="$INPUT_TITLE"
+                  if [ -z "$TITLE" ]; then
+                    TITLE="CasparCG Ember+ ${{ inputs.version }}"
+                  fi
+
+                  {
+                    echo "Windows build for CasparCG Ember+."
+                    echo
+                    echo "Commit: ${{ github.sha }}"
+                    echo "Branch: ${{ github.ref_name }}"
+                    echo
+                    echo "Source code is available in this repository."
+                    if [ -n "$INPUT_NOTES" ]; then
+                      echo
+                      printf '%s\n' "$INPUT_NOTES"
+                    fi
+                  } > release-notes.md
+
+                  echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+
+            - name: Publish GitHub release
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: ${{ inputs.version }}
+                  target_commitish: ${{ github.sha }}
+                  name: ${{ steps.release-meta.outputs.title }}
+                  body_path: release-notes.md
+                  prerelease: ${{ inputs.prerelease }}
+                  files: ${{ steps.rename-build.outputs.artifactname }}
+                  fail_on_unmatched_files: true
