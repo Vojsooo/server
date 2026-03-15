@@ -61,6 +61,7 @@ endif ()
 include_directories("${CMAKE_BINARY_DIR}/generated")
 
 add_subdirectory(tools)
+add_subdirectory(third_party)
 add_subdirectory(accelerator)
 add_subdirectory(common)
 add_subdirectory(core)

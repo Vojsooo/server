@@ -48,6 +48,8 @@
 #include <protocol/amcp/AMCPProtocolStrategy.h>
 #include <protocol/amcp/amcp_command_repository.h>
 #include <protocol/amcp/amcp_shared.h>
+#include <protocol/ember/ember_protocol_strategy.h>
+#include <protocol/ember/ember_provider.h>
 #include <protocol/osc/client.h>
 #include <protocol/util/AsyncEventServer.h>
 #include <protocol/util/strategy_adapters.h>
@@ -104,6 +106,7 @@ struct server::impl
     std::shared_ptr<amcp::amcp_command_repository>         amcp_command_repo_;
     std::shared_ptr<amcp::amcp_command_repository_wrapper> amcp_command_repo_wrapper_;
     std::shared_ptr<amcp::command_context_factory>         amcp_context_factory_;
+    std::shared_ptr<ember::ember_provider>                 ember_provider_;
     std::vector<spl::shared_ptr<IO::AsyncEventServer>>     async_servers_;
     std::shared_ptr<IO::AsyncEventServer>                  primary_amcp_server_;
     std::shared_ptr<osc::client>                           osc_client_ = std::make_shared<osc::client>(io_context_);
@@ -138,6 +141,9 @@ struct server::impl
         setup_amcp_command_repo();
         CASPAR_LOG(info) << L"Initialized command repository.";
 
+        ember_provider_ = std::make_shared<ember::ember_provider>(channels_, amcp_command_repo_);
+        CASPAR_LOG(info) << L"Initialized ember provider.";
+
         module_dependencies dependencies(
             cg_registry_, producer_registry_, consumer_registry_, amcp_command_repo_wrapper_);
         initialize_modules(dependencies);
@@ -163,6 +169,7 @@ struct server::impl
         amcp_command_repo_wrapper_.reset();
         amcp_command_repo_.reset();
         amcp_context_factory_.reset();
+        ember_provider_.reset();
 
         primary_amcp_server_.reset();
         async_servers_.clear();
@@ -467,6 +474,14 @@ struct server::impl
 
         if (boost::iequals(name, L"AMCP"))
             return amcp::create_char_amcp_strategy_factory(port_description, spl::make_shared_ptr(amcp_command_repo_));
+
+        if (boost::iequals(name, L"EMBER_PLUS") || boost::iequals(name, L"EMBER+") ||
+            boost::iequals(name, L"EMBERPLUS")) {
+            if (!ember_provider_)
+                CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Ember+ provider is not initialized."));
+
+            return ember::create_ember_plus_strategy_factory(port_description, ember_provider_);
+        }
 
         CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"Invalid protocol: " + name));
     }

@@ -17,6 +17,12 @@ set(SOURCES
 
 		osc/client.cpp
 
+		ember/ember_command_bridge.cpp
+		ember/ember_protocol_strategy.cpp
+		ember/ember_provider.cpp
+		ember/ember_registry.cpp
+		ember/ember_session.cpp
+
 		util/AsyncEventServer.cpp
 		util/lock_container.cpp
 		util/strategy_adapters.cpp
@@ -46,6 +52,12 @@ set(HEADERS
 
 		osc/client.h
 
+		ember/ember_command_bridge.h
+		ember/ember_protocol_strategy.h
+		ember/ember_provider.h
+		ember/ember_registry.h
+		ember/ember_session.h
+
 		util/AsyncEventServer.h
 		util/ClientInfo.h
 		util/lock_container.h
@@ -64,13 +76,23 @@ target_include_directories(protocol  PRIVATE
     )
 target_precompile_headers(protocol PRIVATE "StdAfx.h")
 
+if(MSVC)
+    set_source_files_properties(
+        ember/ember_command_bridge.cpp
+        ember/ember_protocol_strategy.cpp
+        ember/ember_provider.cpp
+        PROPERTIES COMPILE_OPTIONS "/wd4267"
+    )
+endif()
+
 source_group(sources\\amcp amcp/*)
 source_group(sources\\cii cii/*)
 source_group(sources\\clk clk/*)
+source_group(sources\\ember ember/*)
 source_group(sources\\log log/*)
 source_group(sources\\osc\\oscpack osc/oscpack/*)
 source_group(sources\\osc osc/*)
 source_group(sources\\util util/*)
 source_group(sources ./*)
 
-target_link_libraries(protocol PRIVATE common core)
+target_link_libraries(protocol PRIVATE common core libs101::s101 libember::ember-static)
