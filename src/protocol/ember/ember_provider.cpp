@@ -11,6 +11,7 @@
 
 #include "../StdAfx.h"
 
+#include "ember_diagnostics.h"
 #include "ember_provider.h"
 
 #include <common/env.h>
@@ -50,6 +51,13 @@ constexpr int channels_root_number      = 100;
 constexpr int runtime_root_number       = 2;
 constexpr int runtime_channel_count_param_number = 1;
 constexpr int runtime_state_update_interval_param_number = 2;
+constexpr int runtime_system_node_number = 10;
+constexpr int runtime_system_process_cpu_param_number = 1;
+constexpr int runtime_system_cpu_param_number = 2;
+constexpr int runtime_system_process_resident_param_number = 3;
+constexpr int runtime_system_total_memory_param_number = 4;
+constexpr int runtime_system_available_memory_param_number = 5;
+constexpr int runtime_system_used_memory_param_number = 6;
 constexpr int play_node_number          = 10;
 constexpr int loadbg_node_number        = 11;
 constexpr int pause_node_number         = 12;
@@ -61,8 +69,15 @@ constexpr int load_node_number          = 17;
 constexpr int call_node_number          = 18;
 constexpr int callbg_node_number        = 19;
 constexpr int layers_root_node_number   = 40;
+constexpr int channel_diagnostics_node_number = 41;
+constexpr int channel_audio_node_number = 42;
+constexpr int channel_audio_meter_count_param_number = 1;
+constexpr int channel_audio_raw_peak_node_number = 10;
+constexpr int channel_audio_meter_pct_node_number = 11;
+constexpr int channel_audio_dbfs_node_number = 12;
 constexpr int layer_state_node_number   = 1;
 constexpr int layer_mixer_node_number   = 2;
+constexpr int layer_diagnostics_node_number = 3;
 
 constexpr int clip_layer_param_number       = 1;
 constexpr int clip_loop_param_number        = 2;
@@ -164,8 +179,19 @@ constexpr int layer_mixer_crop_r_pct_param_number     = 41;
 constexpr int layer_mixer_crop_b_pct_param_number     = 42;
 constexpr int layer_mixer_last_param_number           = layer_mixer_crop_b_pct_param_number;
 constexpr int scaled_mixer_factor                 = 1000;
+constexpr int diagnostics_value_factor            = 1000;
+constexpr int runtime_metric_factor               = 100;
 constexpr long minimum_state_update_interval_ms   = 1;
 constexpr long maximum_state_update_interval_ms   = 60000;
+constexpr int audio_meter_first_param_number      = 100;
+constexpr int audio_meter_value_factor            = 32;
+constexpr int audio_meter_percentage_factor       = 100;
+constexpr int audio_meter_min_db                  = -100;
+constexpr int audio_meter_max_db                  = 0;
+constexpr int audio_meter_update_interval_ms      = 100;
+constexpr int audio_meter_stream_identifier_raw_peak_base = 100000;
+constexpr int audio_meter_stream_identifier_pct_base      = 200000;
+constexpr int audio_meter_stream_identifier_dbfs_base     = 300000;
 
 struct live_layer_state
 {
@@ -203,6 +229,26 @@ struct live_layer_state
 using live_layer_map_t      = std::map<int, live_layer_state>;
 using live_snapshot_map_t   = std::map<int, live_layer_map_t>;
 
+struct channel_audio_meter_state
+{
+    int               audio_channel_count = 0;
+    std::vector<long> raw_peak_values;
+    std::vector<long> percent_values;
+    std::vector<long> dbfs_values;
+};
+
+using audio_meter_snapshot_map_t = std::map<int, channel_audio_meter_state>;
+
+enum class audio_meter_kind
+{
+    raw_peak,
+    meter_percent,
+    dbfs
+};
+
+bool parse_audio_meter_stream_identifier(
+    int stream_identifier, audio_meter_kind& kind, int& channel_index, int& meter_index);
+
 struct function_invocation_request
 {
     std::vector<int>                      path;
@@ -213,6 +259,12 @@ struct parameter_write_request
 {
     std::vector<int>        path;
     libember::glow::Value value;
+};
+
+struct stream_command_request
+{
+    std::vector<int> path;
+    int              command_number = 0;
 };
 
 void send_qualified_parameter_update(const IO::client_connection<char>::ptr& client,
@@ -296,6 +348,46 @@ std::string make_provider_state_packet(bool online)
     return to_packet_string(encoder);
 }
 
+const std::vector<long>& audio_meter_values(const channel_audio_meter_state& state, audio_meter_kind kind)
+{
+    switch (kind) {
+        case audio_meter_kind::raw_peak:
+            return state.raw_peak_values;
+        case audio_meter_kind::meter_percent:
+            return state.percent_values;
+        case audio_meter_kind::dbfs:
+        default:
+            return state.dbfs_values;
+    }
+}
+
+std::string build_audio_meter_stream_packet(const audio_meter_snapshot_map_t& snapshot,
+                                            const std::vector<int>&          subscribed_streams)
+{
+    libember::glow::GlowStreamCollection collection;
+    bool                                 has_entries = false;
+
+    for (const auto stream_identifier : subscribed_streams) {
+        audio_meter_kind kind          = audio_meter_kind::dbfs;
+        int              channel_index = 0;
+        int              meter_index   = 0;
+        if (!parse_audio_meter_stream_identifier(stream_identifier, kind, channel_index, meter_index))
+            continue;
+
+        const auto channel_it = snapshot.find(channel_index);
+        if (channel_it == snapshot.end())
+            continue;
+        const auto& values = audio_meter_values(channel_it->second, kind);
+        if (meter_index >= static_cast<int>(values.size()))
+            continue;
+
+        collection.insert(stream_identifier, static_cast<int>(values.at(static_cast<std::size_t>(meter_index))));
+        has_entries = true;
+    }
+
+    return has_entries ? ember_message_builder::encode(collection) : std::string();
+}
+
 void add_string_parameter(libember::glow::GlowNodeBase* parent,
                           int                           number,
                           const std::string&           identifier,
@@ -345,6 +437,64 @@ void add_ranged_integer_parameter(libember::glow::GlowNodeBase* parent,
     parameter->setType(parameter_type_t::Integer);
     parameter->setMinimum(minimum);
     parameter->setMaximum(maximum);
+    parameter->setValue(std::max(minimum, std::min(value, maximum)));
+}
+
+std::string ember_identifier_from_monitor_path(const std::string& path);
+
+void add_scaled_integer_parameter(libember::glow::GlowNodeBase* parent,
+                                  int                           number,
+                                  const std::string&           identifier,
+                                  double                        value,
+                                  int                           factor,
+                                  const std::string&           description,
+                                  const std::string&           format = "%.3f",
+                                  bool                          has_range = false,
+                                  double                        minimum = 0.0,
+                                  double                        maximum = 0.0,
+                                  access_t                      access = access_t::ReadOnly)
+{
+    auto* parameter = new libember::glow::GlowParameter(parent, number);
+    parameter->setIdentifier(identifier);
+    if (!description.empty())
+        parameter->setDescription(description);
+    parameter->setAccess(access);
+    parameter->setType(parameter_type_t::Integer);
+    parameter->setFactor(factor);
+    if (!format.empty())
+        parameter->setFormat(format);
+    if (has_range) {
+        value = std::max(minimum, std::min(value, maximum));
+        parameter->setMinimum(static_cast<long>(std::llround(minimum * factor)));
+        parameter->setMaximum(static_cast<long>(std::llround(maximum * factor)));
+    }
+    parameter->setValue(static_cast<long>(std::llround(value * factor)));
+}
+
+void add_audio_meter_parameter(libember::glow::GlowNodeBase* parent,
+                               int                           number,
+                               const std::string&           identifier,
+                               long                          value,
+                               int                           stream_identifier,
+                               const std::string&           description,
+                               long                          minimum,
+                               long                          maximum,
+                               int                           factor = 0,
+                               const std::string&           format = std::string())
+{
+    auto* parameter = new libember::glow::GlowParameter(parent, number);
+    parameter->setIdentifier(identifier);
+    if (!description.empty())
+        parameter->setDescription(description);
+    parameter->setAccess(access_t::ReadOnly);
+    parameter->setType(parameter_type_t::Integer);
+    if (factor > 0)
+        parameter->setFactor(factor);
+    if (!format.empty())
+        parameter->setFormat(format);
+    parameter->setMinimum(minimum);
+    parameter->setMaximum(maximum);
+    parameter->setStreamIdentifier(stream_identifier);
     parameter->setValue(std::max(minimum, std::min(value, maximum)));
 }
 
@@ -405,12 +555,72 @@ double unscaled_mixer_value(const libember::glow::Value& value, double default_v
     }
 }
 
-double clamp_double(double value, double minimum, double maximum)
+bool mixer_percent_parameter_info(int parameter_number, int& raw_parameter_number)
 {
-    return std::max(minimum, std::min(value, maximum));
+    switch (parameter_number) {
+        case layer_mixer_opacity_pct_param_number:
+            raw_parameter_number = layer_mixer_opacity_param_number;
+            return true;
+        case layer_mixer_brightness_pct_param_number:
+            raw_parameter_number = layer_mixer_brightness_param_number;
+            return true;
+        case layer_mixer_saturation_pct_param_number:
+            raw_parameter_number = layer_mixer_saturation_param_number;
+            return true;
+        case layer_mixer_contrast_pct_param_number:
+            raw_parameter_number = layer_mixer_contrast_param_number;
+            return true;
+        case layer_mixer_volume_pct_param_number:
+            raw_parameter_number = layer_mixer_volume_param_number;
+            return true;
+        case layer_mixer_fill_x_pct_param_number:
+            raw_parameter_number = layer_mixer_fill_x_param_number;
+            return true;
+        case layer_mixer_fill_y_pct_param_number:
+            raw_parameter_number = layer_mixer_fill_y_param_number;
+            return true;
+        case layer_mixer_fill_w_pct_param_number:
+            raw_parameter_number = layer_mixer_fill_w_param_number;
+            return true;
+        case layer_mixer_fill_h_pct_param_number:
+            raw_parameter_number = layer_mixer_fill_h_param_number;
+            return true;
+        case layer_mixer_clip_x_pct_param_number:
+            raw_parameter_number = layer_mixer_clip_x_param_number;
+            return true;
+        case layer_mixer_clip_y_pct_param_number:
+            raw_parameter_number = layer_mixer_clip_y_param_number;
+            return true;
+        case layer_mixer_clip_w_pct_param_number:
+            raw_parameter_number = layer_mixer_clip_w_param_number;
+            return true;
+        case layer_mixer_clip_h_pct_param_number:
+            raw_parameter_number = layer_mixer_clip_h_param_number;
+            return true;
+        case layer_mixer_anchor_x_pct_param_number:
+            raw_parameter_number = layer_mixer_anchor_x_param_number;
+            return true;
+        case layer_mixer_anchor_y_pct_param_number:
+            raw_parameter_number = layer_mixer_anchor_y_param_number;
+            return true;
+        case layer_mixer_crop_l_pct_param_number:
+            raw_parameter_number = layer_mixer_crop_l_param_number;
+            return true;
+        case layer_mixer_crop_t_pct_param_number:
+            raw_parameter_number = layer_mixer_crop_t_param_number;
+            return true;
+        case layer_mixer_crop_r_pct_param_number:
+            raw_parameter_number = layer_mixer_crop_r_param_number;
+            return true;
+        case layer_mixer_crop_b_pct_param_number:
+            raw_parameter_number = layer_mixer_crop_b_param_number;
+            return true;
+        default:
+            return false;
+    }
 }
 
-bool mixer_parameter_range(int parameter_number, double& minimum, double& maximum)
+bool mixer_parameter_editor_range(int parameter_number, double& minimum, double& maximum)
 {
     switch (parameter_number) {
         case layer_mixer_opacity_param_number:
@@ -418,132 +628,29 @@ bool mixer_parameter_range(int parameter_number, double& minimum, double& maximu
         case layer_mixer_saturation_param_number:
         case layer_mixer_contrast_param_number:
         case layer_mixer_volume_param_number:
+            minimum = -100.0;
+            maximum = 100.0;
+            return true;
+        case layer_mixer_fill_x_param_number:
+        case layer_mixer_fill_y_param_number:
         case layer_mixer_fill_w_param_number:
         case layer_mixer_fill_h_param_number:
+        case layer_mixer_clip_x_param_number:
+        case layer_mixer_clip_y_param_number:
         case layer_mixer_clip_w_param_number:
         case layer_mixer_clip_h_param_number:
+        case layer_mixer_anchor_x_param_number:
+        case layer_mixer_anchor_y_param_number:
         case layer_mixer_crop_l_param_number:
         case layer_mixer_crop_t_param_number:
         case layer_mixer_crop_r_param_number:
         case layer_mixer_crop_b_param_number:
-            minimum = 0.0;
-            maximum = 1.0;
-            return true;
-        case layer_mixer_fill_x_param_number:
-        case layer_mixer_fill_y_param_number:
-        case layer_mixer_clip_x_param_number:
-        case layer_mixer_clip_y_param_number:
-        case layer_mixer_anchor_x_param_number:
-        case layer_mixer_anchor_y_param_number:
-            minimum = -1.0;
-            maximum = 1.0;
+            minimum = -100.0;
+            maximum = 100.0;
             return true;
         case layer_mixer_rotation_param_number:
-            minimum = -360.0;
-            maximum = 360.0;
-            return true;
-        default:
-            return false;
-    }
-}
-
-bool mixer_percent_parameter_info(int parameter_number, int& raw_parameter_number, long& minimum, long& maximum)
-{
-    switch (parameter_number) {
-        case layer_mixer_opacity_pct_param_number:
-            raw_parameter_number = layer_mixer_opacity_param_number;
-            minimum              = 0;
-            maximum              = 100;
-            return true;
-        case layer_mixer_brightness_pct_param_number:
-            raw_parameter_number = layer_mixer_brightness_param_number;
-            minimum              = 0;
-            maximum              = 100;
-            return true;
-        case layer_mixer_saturation_pct_param_number:
-            raw_parameter_number = layer_mixer_saturation_param_number;
-            minimum              = 0;
-            maximum              = 100;
-            return true;
-        case layer_mixer_contrast_pct_param_number:
-            raw_parameter_number = layer_mixer_contrast_param_number;
-            minimum              = 0;
-            maximum              = 100;
-            return true;
-        case layer_mixer_volume_pct_param_number:
-            raw_parameter_number = layer_mixer_volume_param_number;
-            minimum              = 0;
-            maximum              = 100;
-            return true;
-        case layer_mixer_fill_x_pct_param_number:
-            raw_parameter_number = layer_mixer_fill_x_param_number;
-            minimum              = -100;
-            maximum              = 100;
-            return true;
-        case layer_mixer_fill_y_pct_param_number:
-            raw_parameter_number = layer_mixer_fill_y_param_number;
-            minimum              = -100;
-            maximum              = 100;
-            return true;
-        case layer_mixer_fill_w_pct_param_number:
-            raw_parameter_number = layer_mixer_fill_w_param_number;
-            minimum              = 0;
-            maximum              = 100;
-            return true;
-        case layer_mixer_fill_h_pct_param_number:
-            raw_parameter_number = layer_mixer_fill_h_param_number;
-            minimum              = 0;
-            maximum              = 100;
-            return true;
-        case layer_mixer_clip_x_pct_param_number:
-            raw_parameter_number = layer_mixer_clip_x_param_number;
-            minimum              = -100;
-            maximum              = 100;
-            return true;
-        case layer_mixer_clip_y_pct_param_number:
-            raw_parameter_number = layer_mixer_clip_y_param_number;
-            minimum              = -100;
-            maximum              = 100;
-            return true;
-        case layer_mixer_clip_w_pct_param_number:
-            raw_parameter_number = layer_mixer_clip_w_param_number;
-            minimum              = 0;
-            maximum              = 100;
-            return true;
-        case layer_mixer_clip_h_pct_param_number:
-            raw_parameter_number = layer_mixer_clip_h_param_number;
-            minimum              = 0;
-            maximum              = 100;
-            return true;
-        case layer_mixer_anchor_x_pct_param_number:
-            raw_parameter_number = layer_mixer_anchor_x_param_number;
-            minimum              = -100;
-            maximum              = 100;
-            return true;
-        case layer_mixer_anchor_y_pct_param_number:
-            raw_parameter_number = layer_mixer_anchor_y_param_number;
-            minimum              = -100;
-            maximum              = 100;
-            return true;
-        case layer_mixer_crop_l_pct_param_number:
-            raw_parameter_number = layer_mixer_crop_l_param_number;
-            minimum              = 0;
-            maximum              = 100;
-            return true;
-        case layer_mixer_crop_t_pct_param_number:
-            raw_parameter_number = layer_mixer_crop_t_param_number;
-            minimum              = 0;
-            maximum              = 100;
-            return true;
-        case layer_mixer_crop_r_pct_param_number:
-            raw_parameter_number = layer_mixer_crop_r_param_number;
-            minimum              = 0;
-            maximum              = 100;
-            return true;
-        case layer_mixer_crop_b_pct_param_number:
-            raw_parameter_number = layer_mixer_crop_b_param_number;
-            minimum              = 0;
-            maximum              = 100;
+            minimum = -3600.0;
+            maximum = 3600.0;
             return true;
         default:
             return false;
@@ -552,20 +659,14 @@ bool mixer_percent_parameter_info(int parameter_number, int& raw_parameter_numbe
 
 double clamp_mixer_parameter_value(int parameter_number, double value)
 {
-    double minimum = 0.0;
-    double maximum = 0.0;
-    if (!mixer_parameter_range(parameter_number, minimum, maximum))
-        return value;
-
-    return clamp_double(value, minimum, maximum);
+    static_cast<void>(parameter_number);
+    return value;
 }
 
 double raw_value_from_percent_parameter(int parameter_number, const libember::glow::Value& value)
 {
-    int  raw_parameter_number = 0;
-    long minimum             = 0;
-    long maximum             = 0;
-    if (!mixer_percent_parameter_info(parameter_number, raw_parameter_number, minimum, maximum))
+    int raw_parameter_number = 0;
+    if (!mixer_percent_parameter_info(parameter_number, raw_parameter_number))
         return 0.0;
 
     double percent = 0.0;
@@ -590,7 +691,6 @@ double raw_value_from_percent_parameter(int parameter_number, const libember::gl
             break;
     }
 
-    percent = clamp_double(percent, static_cast<double>(minimum), static_cast<double>(maximum));
     return clamp_mixer_parameter_value(raw_parameter_number, percent / 100.0);
 }
 
@@ -614,10 +714,9 @@ void add_scaled_parameter(libember::glow::GlowNodeBase* parent,
         parameter->setFormat(format);
     double minimum = 0.0;
     double maximum = 0.0;
-    if (mixer_parameter_range(number, minimum, maximum)) {
+    if (mixer_parameter_editor_range(number, minimum, maximum)) {
         parameter->setMinimum(scaled_mixer_value(minimum, factor));
         parameter->setMaximum(scaled_mixer_value(maximum, factor));
-        value = clamp_double(value, minimum, maximum);
     }
     parameter->setValue(scaled_mixer_value(value, factor));
 }
@@ -637,12 +736,14 @@ void add_percent_parameter(libember::glow::GlowNodeBase* parent,
     parameter->setType(parameter_type_t::Integer);
     parameter->setFormat("%d");
 
-    int  raw_parameter_number = 0;
-    long minimum             = 0;
-    long maximum             = 0;
-    if (mixer_percent_parameter_info(number, raw_parameter_number, minimum, maximum)) {
-        parameter->setMinimum(minimum);
-        parameter->setMaximum(maximum);
+    int raw_parameter_number = 0;
+    if (mixer_percent_parameter_info(number, raw_parameter_number)) {
+        double minimum = 0.0;
+        double maximum = 0.0;
+        if (mixer_parameter_editor_range(raw_parameter_number, minimum, maximum)) {
+            parameter->setMinimum(static_cast<long>(std::llround(minimum * 100.0)));
+            parameter->setMaximum(static_cast<long>(std::llround(maximum * 100.0)));
+        }
         value = clamp_mixer_parameter_value(raw_parameter_number, value);
         parameter->setValue(static_cast<long>(std::llround(value * 100.0)));
     } else {
@@ -783,6 +884,55 @@ std::string ember_label_from_key(const std::string& key)
     return label.empty() ? "Value" : label;
 }
 
+std::string diagnostic_metric_identifier(const std::string& key, bool is_counter = false)
+{
+    auto identifier = ember_identifier_from_monitor_path(key);
+    if (is_counter)
+        identifier += "Count";
+    return identifier;
+}
+
+std::string diagnostic_metric_description(const std::string& key, bool is_counter = false)
+{
+    auto description = ember_label_from_key(key);
+    if (is_counter)
+        description += "Count";
+    return description;
+}
+
+void append_diagnostic_sources(libember::glow::GlowNodeBase* parent,
+                               const std::map<std::string, diagnostic_source_snapshot>& sources)
+{
+    int source_number = 1;
+
+    for (const auto& source_entry : sources) {
+        const auto& source = source_entry.second;
+        auto* source_node  = new libember::glow::GlowNode(parent, source_number++);
+        source_node->setIdentifier(source.identifier);
+        source_node->setDescription(source.description.empty() ? source.identifier : source.description);
+        source_node->setIsOnline(true);
+
+        int parameter_number = 1;
+        for (const auto& value_entry : source.values) {
+            const auto label = diagnostic_metric_identifier(value_entry.first);
+            add_scaled_integer_parameter(source_node,
+                                         parameter_number++,
+                                         label,
+                                         value_entry.second,
+                                         diagnostics_value_factor,
+                                         label);
+        }
+
+        for (const auto& counter_entry : source.counters) {
+            const auto label = diagnostic_metric_identifier(counter_entry.first, true);
+            const auto value =
+                static_cast<long>(std::min<std::uint64_t>(counter_entry.second,
+                                                          static_cast<std::uint64_t>(std::numeric_limits<long>::max())));
+            add_integer_parameter(source_node, parameter_number++, label, value, label);
+        }
+    }
+}
+
 bool monitor_to_bool(const core::monitor::vector_t& values, bool default_value = false)
 {
     if (const auto* value = monitor_value_as<bool>(values))
@@ -805,6 +955,191 @@ std::int64_t monitor_to_int64(const core::monitor::vector_t& values, std::int64_
     if (const auto* value = monitor_value_as<std::uint64_t>(values))
         return static_cast<std::int64_t>(*value);
     return default_value;
+}
+
+std::int64_t monitor_scalar_to_int64(const core::monitor::data_t& value, std::int64_t default_value = -1)
+{
+    struct visitor : boost::static_visitor<std::int64_t>
+    {
+        std::int64_t default_value;
+
+        explicit visitor(std::int64_t default_value)
+            : default_value(default_value)
+        {
+        }
+
+        std::int64_t operator()(bool value) const { return value ? 1 : 0; }
+        std::int64_t operator()(std::int32_t value) const { return value; }
+        std::int64_t operator()(std::int64_t value) const { return value; }
+        std::int64_t operator()(std::uint32_t value) const { return value; }
+        std::int64_t operator()(std::uint64_t value) const
+        {
+            return value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
+                       ? std::numeric_limits<std::int64_t>::max()
+                       : static_cast<std::int64_t>(value);
+        }
+        std::int64_t operator()(float value) const { return static_cast<std::int64_t>(std::llround(value)); }
+        std::int64_t operator()(double value) const { return static_cast<std::int64_t>(std::llround(value)); }
+        std::int64_t operator()(const std::string&) const { return default_value; }
+        std::int64_t operator()(const std::wstring&) const { return default_value; }
+    };
+
+    return boost::apply_visitor(visitor(default_value), value);
+}
+
+const core::monitor::vector_t* find_monitor_entry(const core::monitor::state& state, const std::string& key)
+{
+    for (const auto& entry : state) {
+        if (entry.first == key)
+            return &entry.second;
+    }
+
+    return nullptr;
+}
+
+int audio_meter_parameter_number(int meter_index) { return audio_meter_first_param_number + meter_index; }
+
+int audio_meter_node_number(audio_meter_kind kind)
+{
+    switch (kind) {
+        case audio_meter_kind::raw_peak:
+            return channel_audio_raw_peak_node_number;
+        case audio_meter_kind::meter_percent:
+            return channel_audio_meter_pct_node_number;
+        case audio_meter_kind::dbfs:
+        default:
+            return channel_audio_dbfs_node_number;
+    }
+}
+
+int audio_meter_stream_identifier_base(audio_meter_kind kind)
+{
+    switch (kind) {
+        case audio_meter_kind::raw_peak:
+            return audio_meter_stream_identifier_raw_peak_base;
+        case audio_meter_kind::meter_percent:
+            return audio_meter_stream_identifier_pct_base;
+        case audio_meter_kind::dbfs:
+        default:
+            return audio_meter_stream_identifier_dbfs_base;
+    }
+}
+
+int audio_meter_stream_identifier(audio_meter_kind kind, int channel_index, int meter_index)
+{
+    return audio_meter_stream_identifier_base(kind) + channel_index * 100 + meter_index + 1;
+}
+
+std::vector<int> audio_meter_parameter_path(audio_meter_kind kind, int channel_index, int meter_index)
+{
+    return {
+        channels_root_number, channel_index, channel_audio_node_number, audio_meter_node_number(kind), audio_meter_parameter_number(meter_index)};
+}
+
+bool audio_meter_path_matches_prefix(const std::vector<int>& prefix, audio_meter_kind kind, int channel_index, int meter_index)
+{
+    const auto full_path = audio_meter_parameter_path(kind, channel_index, meter_index);
+    return prefix.size() <= full_path.size() && std::equal(prefix.begin(), prefix.end(), full_path.begin());
+}
+
+bool parse_audio_meter_stream_identifier(int stream_identifier, audio_meter_kind& kind, int& channel_index, int& meter_index)
+{
+    for (const auto candidate : {audio_meter_kind::raw_peak, audio_meter_kind::meter_percent, audio_meter_kind::dbfs}) {
+        const auto relative = stream_identifier - audio_meter_stream_identifier_base(candidate);
+        if (relative <= 0)
+            continue;
+
+        const auto parsed_channel_index = relative / 100;
+        const auto parsed_meter_index   = relative % 100 - 1;
+        if (parsed_channel_index <= 0 || parsed_meter_index < 0)
+            continue;
+
+        kind          = candidate;
+        channel_index = parsed_channel_index;
+        meter_index   = parsed_meter_index;
+        return true;
+    }
+
+    return false;
+}
+
+long audio_meter_raw_peak_value_from_peak(std::int64_t peak)
+{
+    if (peak <= 0)
+        return 0;
+
+    const auto clamped_peak =
+        std::min<std::int64_t>(peak, static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()));
+    return static_cast<long>(clamped_peak);
+}
+
+long audio_meter_percent_value_from_peak(std::int64_t peak)
+{
+    if (peak <= 0)
+        return 0;
+
+    const auto clamped_peak =
+        std::min<std::int64_t>(peak, static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()));
+    const auto ratio = static_cast<double>(clamped_peak) / static_cast<double>(std::numeric_limits<std::int32_t>::max());
+    if (ratio <= 0.0)
+        return 0;
+
+    const auto percent = std::max(0.0, std::min(ratio * 100.0, 100.0));
+    return static_cast<long>(std::llround(percent * audio_meter_percentage_factor));
+}
+
+double audio_meter_dbfs_from_peak(std::int64_t peak)
+{
+    if (peak <= 0)
+        return static_cast<double>(audio_meter_min_db);
+
+    const auto clamped_peak =
+        std::min<std::int64_t>(peak, static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()));
+    const auto ratio = static_cast<double>(clamped_peak) / static_cast<double>(std::numeric_limits<std::int32_t>::max());
+    if (ratio <= 0.0)
+        return static_cast<double>(audio_meter_min_db);
+
+    const auto db = 20.0 * std::log10(ratio);
+    if (!std::isfinite(db))
+        return static_cast<double>(audio_meter_min_db);
+
+    return std::max(static_cast<double>(audio_meter_min_db), std::min(db, static_cast<double>(audio_meter_max_db)));
+}
+
+long audio_meter_stream_value_from_peak(std::int64_t peak)
+{
+    return static_cast<long>(std::llround(audio_meter_dbfs_from_peak(peak) * audio_meter_value_factor));
+}
+
+audio_meter_snapshot_map_t collect_audio_meter_snapshot(const spl::shared_ptr<std::vector<amcp::channel_context>>& channels)
+{
+    audio_meter_snapshot_map_t snapshot;
+
+    for (const auto& channel : *channels) {
+        const auto channel_index = channel.raw_channel->index();
+        const auto meter_count = std::max(0, channel.raw_channel->stage()->video_format_desc().audio_channels);
+        auto&      meter_state = snapshot[channel_index];
+        meter_state.audio_channel_count = meter_count;
+        meter_state.raw_peak_values.assign(static_cast<std::size_t>(meter_count), 0);
+        meter_state.percent_values.assign(static_cast<std::size_t>(meter_count), 0);
+        meter_state.dbfs_values.assign(static_cast<std::size_t>(meter_count),
+                                       static_cast<long>(audio_meter_min_db * audio_meter_value_factor));
+
+        const auto channel_state = channel.raw_channel->state();
+        const auto* values       = find_monitor_entry(channel_state, "mixer/audio/volume");
+        if (values == nullptr)
+            continue;
+
+        const auto count = std::min<std::size_t>(meter_state.raw_peak_values.size(), values->size());
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto peak = monitor_scalar_to_int64(values->at(index), 0);
+            meter_state.raw_peak_values[index] = audio_meter_raw_peak_value_from_peak(peak);
+            meter_state.percent_values[index]  = audio_meter_percent_value_from_peak(peak);
+            meter_state.dbfs_values[index]     = audio_meter_stream_value_from_peak(peak);
+        }
+    }
+
+    return snapshot;
 }
 
 int blend_index_from_mode(core::blend_mode mode)
@@ -1386,86 +1721,48 @@ void send_live_layer_diff(const IO::client_connection<char>::ptr& client,
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_keyer_param_number);
     if (previous.invert != current.invert)
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_invert_param_number);
-    if (!nearly_equal(previous.opacity, current.opacity)) {
+    if (!nearly_equal(previous.opacity, current.opacity))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_opacity_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_opacity_pct_param_number);
-    }
-    if (!nearly_equal(previous.brightness, current.brightness)) {
+    if (!nearly_equal(previous.brightness, current.brightness))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_brightness_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_brightness_pct_param_number);
-    }
-    if (!nearly_equal(previous.saturation, current.saturation)) {
+    if (!nearly_equal(previous.saturation, current.saturation))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_saturation_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_saturation_pct_param_number);
-    }
-    if (!nearly_equal(previous.contrast, current.contrast)) {
+    if (!nearly_equal(previous.contrast, current.contrast))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_contrast_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_contrast_pct_param_number);
-    }
     if (!nearly_equal(previous.rotation, current.rotation))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_rotation_param_number);
-    if (!nearly_equal(previous.volume, current.volume)) {
+    if (!nearly_equal(previous.volume, current.volume))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_volume_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_volume_pct_param_number);
-    }
     if (previous.blend != current.blend)
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_blend_param_number);
-    if (!nearly_equal(previous.fill_x, current.fill_x)) {
+    if (!nearly_equal(previous.fill_x, current.fill_x))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_fill_x_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_fill_x_pct_param_number);
-    }
-    if (!nearly_equal(previous.fill_y, current.fill_y)) {
+    if (!nearly_equal(previous.fill_y, current.fill_y))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_fill_y_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_fill_y_pct_param_number);
-    }
-    if (!nearly_equal(previous.fill_w, current.fill_w)) {
+    if (!nearly_equal(previous.fill_w, current.fill_w))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_fill_w_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_fill_w_pct_param_number);
-    }
-    if (!nearly_equal(previous.fill_h, current.fill_h)) {
+    if (!nearly_equal(previous.fill_h, current.fill_h))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_fill_h_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_fill_h_pct_param_number);
-    }
-    if (!nearly_equal(previous.clip_x, current.clip_x)) {
+    if (!nearly_equal(previous.clip_x, current.clip_x))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_clip_x_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_clip_x_pct_param_number);
-    }
-    if (!nearly_equal(previous.clip_y, current.clip_y)) {
+    if (!nearly_equal(previous.clip_y, current.clip_y))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_clip_y_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_clip_y_pct_param_number);
-    }
-    if (!nearly_equal(previous.clip_w, current.clip_w)) {
+    if (!nearly_equal(previous.clip_w, current.clip_w))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_clip_w_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_clip_w_pct_param_number);
-    }
-    if (!nearly_equal(previous.clip_h, current.clip_h)) {
+    if (!nearly_equal(previous.clip_h, current.clip_h))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_clip_h_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_clip_h_pct_param_number);
-    }
-    if (!nearly_equal(previous.anchor_x, current.anchor_x)) {
+    if (!nearly_equal(previous.anchor_x, current.anchor_x))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_anchor_x_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_anchor_x_pct_param_number);
-    }
-    if (!nearly_equal(previous.anchor_y, current.anchor_y)) {
+    if (!nearly_equal(previous.anchor_y, current.anchor_y))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_anchor_y_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_anchor_y_pct_param_number);
-    }
-    if (!nearly_equal(previous.crop_l, current.crop_l)) {
+    if (!nearly_equal(previous.crop_l, current.crop_l))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_crop_l_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_crop_l_pct_param_number);
-    }
-    if (!nearly_equal(previous.crop_t, current.crop_t)) {
+    if (!nearly_equal(previous.crop_t, current.crop_t))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_crop_t_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_crop_t_pct_param_number);
-    }
-    if (!nearly_equal(previous.crop_r, current.crop_r)) {
+    if (!nearly_equal(previous.crop_r, current.crop_r))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_crop_r_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_crop_r_pct_param_number);
-    }
-    if (!nearly_equal(previous.crop_b, current.crop_b)) {
+    if (!nearly_equal(previous.crop_b, current.crop_b))
         send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_crop_b_param_number);
-        send_live_layer_mixer_parameter(client, channel_index, current, layer_mixer_crop_b_pct_param_number);
-    }
 }
 
 std::vector<std::wstring> available_play_clips()
@@ -2084,6 +2381,74 @@ void collect_parameter_writes(const libember::dom::Node&              node,
     }
 }
 
+void collect_stream_commands(const libember::dom::Node&             node,
+                             const std::vector<int>&                current_path,
+                             std::vector<stream_command_request>& requests)
+{
+    const auto type = libember::ber::Type::fromTag(node.typeTag());
+    if (!type.isApplicationDefined())
+        return;
+
+    const auto visit_children = [&](const libember::dom::Container* container, const std::vector<int>& path) {
+        if (container == nullptr)
+            return;
+
+        for (auto it = container->begin(); it != container->end(); ++it) {
+            const auto child_type = libember::ber::Type::fromTag(it->typeTag());
+            if (child_type.isApplicationDefined() && child_type.value() == libember::glow::GlowType::Command) {
+                const auto& command = dynamic_cast<const libember::glow::GlowCommand&>(*it);
+                const auto  number  = command.number().value();
+                if (number == libember::glow::CommandType::Subscribe ||
+                    number == libember::glow::CommandType::Unsubscribe) {
+                    requests.push_back({path, number});
+                }
+                continue;
+            }
+
+            collect_stream_commands(*it, path, requests);
+        }
+    };
+
+    switch (type.value()) {
+        case libember::glow::GlowType::RootElementCollection:
+        case libember::glow::GlowType::ElementCollection: {
+            const auto* container = dynamic_cast<const libember::dom::Container*>(&node);
+            if (container == nullptr)
+                return;
+
+            for (auto it = container->begin(); it != container->end(); ++it)
+                collect_stream_commands(*it, current_path, requests);
+            return;
+        }
+        case libember::glow::GlowType::QualifiedNode: {
+            const auto& qualified_node = dynamic_cast<const libember::glow::GlowQualifiedNode&>(node);
+            visit_children(qualified_node.children(), to_path(qualified_node.path()));
+            return;
+        }
+        case libember::glow::GlowType::Node: {
+            const auto& node_ref = dynamic_cast<const libember::glow::GlowNode&>(node);
+            auto        path     = current_path;
+            path.push_back(node_ref.number());
+            visit_children(node_ref.children(), path);
+            return;
+        }
+        case libember::glow::GlowType::QualifiedParameter: {
+            const auto& parameter = dynamic_cast<const libember::glow::GlowQualifiedParameter&>(node);
+            visit_children(parameter.children(), to_path(parameter.path()));
+            return;
+        }
+        case libember::glow::GlowType::Parameter: {
+            const auto& parameter = dynamic_cast<const libember::glow::GlowParameter&>(node);
+            auto        path      = current_path;
+            path.push_back(parameter.number());
+            visit_children(parameter.children(), path);
+            return;
+        }
+        default:
+            return;
+    }
+}
+
 void send_invocation_result(const IO::client_connection<char>::ptr&      client,
                             int                                          invocation_id,
                             const ember_command_bridge::invocation_result& invocation_result)
@@ -2105,7 +2470,10 @@ std::string build_directory_response(const spl::shared_ptr<std::vector<amcp::cha
                                      const std::shared_ptr<ember_registry>&                     registry,
                                      const ember_command_bridge&                                command_bridge,
                                      long                                                       state_update_interval_ms,
+                                     const system_snapshot&                                     runtime_system_snapshot,
+                                     const diagnostics_snapshot_map_t&                          diagnostics_snapshot,
                                      const live_snapshot_map_t&                                 live_snapshot,
+                                     const audio_meter_snapshot_map_t&                          audio_snapshot,
                                      const std::vector<std::wstring>&                           media_clips,
                                      const std::map<int, ember_provider::clip_command_state>&   play_controls,
                                      const std::map<int, ember_provider::clip_command_state>&   loadbg_controls,
@@ -2149,6 +2517,61 @@ std::string build_directory_response(const spl::shared_ptr<std::vector<amcp::cha
                                  maximum_state_update_interval_ms,
                                  "StateUpdateIntervalMs",
                                  access_t::ReadWrite);
+    auto* runtime_system = new libember::glow::GlowNode(runtime, runtime_system_node_number);
+    runtime_system->setIdentifier("System");
+    runtime_system->setDescription("System");
+    runtime_system->setIsOnline(true);
+    add_scaled_integer_parameter(runtime_system,
+                                 runtime_system_process_cpu_param_number,
+                                 "ProcessCpu%",
+                                 runtime_system_snapshot.process_cpu_pct,
+                                 runtime_metric_factor,
+                                 "ProcessCpu%",
+                                 "%.2f",
+                                 true,
+                                 0.0,
+                                 100.0);
+    add_scaled_integer_parameter(runtime_system,
+                                 runtime_system_cpu_param_number,
+                                 "SystemCpu%",
+                                 runtime_system_snapshot.system_cpu_pct,
+                                 runtime_metric_factor,
+                                 "SystemCpu%",
+                                 "%.2f",
+                                 true,
+                                 0.0,
+                                 100.0);
+    add_scaled_integer_parameter(runtime_system,
+                                 runtime_system_process_resident_param_number,
+                                 "ProcessResidentMB",
+                                 runtime_system_snapshot.process_resident_mb,
+                                 runtime_metric_factor,
+                                 "ProcessResidentMB",
+                                 "%.2f");
+    add_scaled_integer_parameter(runtime_system,
+                                 runtime_system_total_memory_param_number,
+                                 "SystemTotalMemoryMB",
+                                 runtime_system_snapshot.system_total_memory_mb,
+                                 runtime_metric_factor,
+                                 "SystemTotalMemoryMB",
+                                 "%.2f");
+    add_scaled_integer_parameter(runtime_system,
+                                 runtime_system_available_memory_param_number,
+                                 "SystemAvailableMemoryMB",
+                                 runtime_system_snapshot.system_available_memory_mb,
+                                 runtime_metric_factor,
+                                 "SystemAvailableMemoryMB",
+                                 "%.2f");
+    add_scaled_integer_parameter(runtime_system,
+                                 runtime_system_used_memory_param_number,
+                                 "SystemUsedMemory%",
+                                 runtime_system_snapshot.system_used_memory_pct,
+                                 runtime_metric_factor,
+                                 "SystemUsedMemory%",
+                                 "%.2f",
+                                 true,
+                                 0.0,
+                                 100.0);
 
     auto* compatibility = new libember::glow::GlowNode(root.get(), 5);
     compatibility->setIdentifier("compatibility");
@@ -2388,10 +2811,92 @@ std::string build_directory_response(const spl::shared_ptr<std::vector<amcp::cha
                       "CallBg",
                       callbg_it != callbg_controls.end() ? callbg_it->second : ember_provider::call_command_state());
 
+        auto* audio_node = new libember::glow::GlowNode(channel_node, channel_audio_node_number);
+        audio_node->setIdentifier("Audio");
+        audio_node->setDescription("Audio");
+        audio_node->setIsOnline(true);
+
+        const auto audio_it = audio_snapshot.find(index);
+        const auto audio_channel_count = audio_it != audio_snapshot.end()
+                                             ? audio_it->second.audio_channel_count
+                                             : std::max(0, channel.raw_channel->stage()->video_format_desc().audio_channels);
+        add_integer_parameter(audio_node,
+                              channel_audio_meter_count_param_number,
+                              "Count",
+                              audio_channel_count,
+                              "Count");
+        auto* raw_peak_node = new libember::glow::GlowNode(audio_node, channel_audio_raw_peak_node_number);
+        raw_peak_node->setIdentifier("RawPeak");
+        raw_peak_node->setDescription("RawPeak");
+        raw_peak_node->setIsOnline(true);
+
+        auto* meter_pct_node = new libember::glow::GlowNode(audio_node, channel_audio_meter_pct_node_number);
+        meter_pct_node->setIdentifier("MeterPct");
+        meter_pct_node->setDescription("Meter%");
+        meter_pct_node->setIsOnline(true);
+
+        auto* dbfs_node = new libember::glow::GlowNode(audio_node, channel_audio_dbfs_node_number);
+        dbfs_node->setIdentifier("dBFS");
+        dbfs_node->setDescription("dBFS");
+        dbfs_node->setIsOnline(true);
+
+        for (int meter_index = 0; meter_index < audio_channel_count; ++meter_index) {
+            const auto label = "Ch" + std::to_string(meter_index + 1);
+            const auto raw_peak_value =
+                audio_it != audio_snapshot.end() && meter_index < static_cast<int>(audio_it->second.raw_peak_values.size())
+                    ? audio_it->second.raw_peak_values.at(static_cast<std::size_t>(meter_index))
+                    : 0L;
+            const auto percent_value =
+                audio_it != audio_snapshot.end() && meter_index < static_cast<int>(audio_it->second.percent_values.size())
+                    ? audio_it->second.percent_values.at(static_cast<std::size_t>(meter_index))
+                    : 0L;
+            const auto dbfs_value =
+                audio_it != audio_snapshot.end() && meter_index < static_cast<int>(audio_it->second.dbfs_values.size())
+                    ? audio_it->second.dbfs_values.at(static_cast<std::size_t>(meter_index))
+                    : static_cast<long>(audio_meter_min_db * audio_meter_value_factor);
+
+            add_audio_meter_parameter(raw_peak_node,
+                                      audio_meter_parameter_number(meter_index),
+                                      label,
+                                      raw_peak_value,
+                                      audio_meter_stream_identifier(audio_meter_kind::raw_peak, index, meter_index),
+                                      label,
+                                      0,
+                                      static_cast<long>(std::numeric_limits<std::int32_t>::max()));
+            add_audio_meter_parameter(meter_pct_node,
+                                      audio_meter_parameter_number(meter_index),
+                                      label,
+                                      percent_value,
+                                      audio_meter_stream_identifier(audio_meter_kind::meter_percent, index, meter_index),
+                                      label,
+                                      0,
+                                      100L * audio_meter_percentage_factor,
+                                      audio_meter_percentage_factor,
+                                      "%.2f %%");
+            add_audio_meter_parameter(dbfs_node,
+                                      audio_meter_parameter_number(meter_index),
+                                      label,
+                                      dbfs_value,
+                                      audio_meter_stream_identifier(audio_meter_kind::dbfs, index, meter_index),
+                                      label,
+                                      static_cast<long>(audio_meter_min_db * audio_meter_value_factor),
+                                      static_cast<long>(audio_meter_max_db * audio_meter_value_factor),
+                                      audio_meter_value_factor,
+                                      "%.2f dBFS");
+        }
+
         auto* layers_node = new libember::glow::GlowNode(channel_node, layers_root_node_number);
         layers_node->setIdentifier("Layers");
         layers_node->setDescription("Layers");
         layers_node->setIsOnline(true);
+
+        auto* diagnostics_node = new libember::glow::GlowNode(channel_node, channel_diagnostics_node_number);
+        diagnostics_node->setIdentifier("Diagnostics");
+        diagnostics_node->setDescription("Diagnostics");
+        diagnostics_node->setIsOnline(true);
+        const auto diagnostics_it = diagnostics_snapshot.find(index);
+        if (diagnostics_it != diagnostics_snapshot.end())
+            append_diagnostic_sources(diagnostics_node, diagnostics_it->second.channel_sources);
 
         const auto live_channel_it = live_snapshot.find(index);
         if (live_channel_it != live_snapshot.end()) {
@@ -2438,42 +2943,24 @@ std::string build_directory_response(const spl::shared_ptr<std::vector<amcp::cha
                     mixer_node, layer_mixer_invert_param_number, "Invert", live_layer.invert, "Invert", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_opacity_param_number, "Opacity", live_layer.opacity, "Opacity", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_opacity_pct_param_number, "Opacity%", live_layer.opacity, "Opacity%", access_t::ReadWrite);
                 add_scaled_parameter(mixer_node,
                                      layer_mixer_brightness_param_number,
                                      "Brightness",
                                      live_layer.brightness,
                                      "Brightness",
                                      access_t::ReadWrite);
-                add_percent_parameter(mixer_node,
-                                      layer_mixer_brightness_pct_param_number,
-                                      "Brightness%",
-                                      live_layer.brightness,
-                                      "Brightness%",
-                                      access_t::ReadWrite);
                 add_scaled_parameter(mixer_node,
                                      layer_mixer_saturation_param_number,
                                      "Saturation",
                                      live_layer.saturation,
                                      "Saturation",
                                      access_t::ReadWrite);
-                add_percent_parameter(mixer_node,
-                                      layer_mixer_saturation_pct_param_number,
-                                      "Saturation%",
-                                      live_layer.saturation,
-                                      "Saturation%",
-                                      access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_contrast_param_number, "Contrast", live_layer.contrast, "Contrast", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_contrast_pct_param_number, "Contrast%", live_layer.contrast, "Contrast%", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_rotation_param_number, "Rotation", live_layer.rotation, "Rotation", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_volume_param_number, "Volume", live_layer.volume, "Volume", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_volume_pct_param_number, "Volume%", live_layer.volume, "Volume%", access_t::ReadWrite);
                 add_enum_parameter(mixer_node,
                                    layer_mixer_blend_param_number,
                                    "Blend",
@@ -2483,68 +2970,43 @@ std::string build_directory_response(const spl::shared_ptr<std::vector<amcp::cha
                                    access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_fill_x_param_number, "FillX", live_layer.fill_x, "FillX", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_fill_x_pct_param_number, "FillX%", live_layer.fill_x, "FillX%", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_fill_y_param_number, "FillY", live_layer.fill_y, "FillY", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_fill_y_pct_param_number, "FillY%", live_layer.fill_y, "FillY%", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_fill_w_param_number, "FillW", live_layer.fill_w, "FillW", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_fill_w_pct_param_number, "FillW%", live_layer.fill_w, "FillW%", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_fill_h_param_number, "FillH", live_layer.fill_h, "FillH", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_fill_h_pct_param_number, "FillH%", live_layer.fill_h, "FillH%", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_clip_x_param_number, "ClipX", live_layer.clip_x, "ClipX", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_clip_x_pct_param_number, "ClipX%", live_layer.clip_x, "ClipX%", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_clip_y_param_number, "ClipY", live_layer.clip_y, "ClipY", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_clip_y_pct_param_number, "ClipY%", live_layer.clip_y, "ClipY%", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_clip_w_param_number, "ClipW", live_layer.clip_w, "ClipW", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_clip_w_pct_param_number, "ClipW%", live_layer.clip_w, "ClipW%", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_clip_h_param_number, "ClipH", live_layer.clip_h, "ClipH", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_clip_h_pct_param_number, "ClipH%", live_layer.clip_h, "ClipH%", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_anchor_x_param_number, "AnchorX", live_layer.anchor_x, "AnchorX", access_t::ReadWrite);
-                add_percent_parameter(mixer_node,
-                                      layer_mixer_anchor_x_pct_param_number,
-                                      "AnchorX%",
-                                      live_layer.anchor_x,
-                                      "AnchorX%",
-                                      access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_anchor_y_param_number, "AnchorY", live_layer.anchor_y, "AnchorY", access_t::ReadWrite);
-                add_percent_parameter(mixer_node,
-                                      layer_mixer_anchor_y_pct_param_number,
-                                      "AnchorY%",
-                                      live_layer.anchor_y,
-                                      "AnchorY%",
-                                      access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_crop_l_param_number, "CropL", live_layer.crop_l, "CropL", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_crop_l_pct_param_number, "CropL%", live_layer.crop_l, "CropL%", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_crop_t_param_number, "CropT", live_layer.crop_t, "CropT", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_crop_t_pct_param_number, "CropT%", live_layer.crop_t, "CropT%", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_crop_r_param_number, "CropR", live_layer.crop_r, "CropR", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_crop_r_pct_param_number, "CropR%", live_layer.crop_r, "CropR%", access_t::ReadWrite);
                 add_scaled_parameter(
                     mixer_node, layer_mixer_crop_b_param_number, "CropB", live_layer.crop_b, "CropB", access_t::ReadWrite);
-                add_percent_parameter(
-                    mixer_node, layer_mixer_crop_b_pct_param_number, "CropB%", live_layer.crop_b, "CropB%", access_t::ReadWrite);
+
+                auto* layer_diagnostics_node = new libember::glow::GlowNode(layer_node, layer_diagnostics_node_number);
+                layer_diagnostics_node->setIdentifier("Diagnostics");
+                layer_diagnostics_node->setDescription("Diagnostics");
+                layer_diagnostics_node->setIsOnline(true);
+                if (diagnostics_it != diagnostics_snapshot.end()) {
+                    const auto layer_diagnostics_it =
+                        diagnostics_it->second.layer_sources.find(live_layer.layer_index);
+                    if (layer_diagnostics_it != diagnostics_it->second.layer_sources.end())
+                        append_diagnostic_sources(layer_diagnostics_node, layer_diagnostics_it->second);
+                }
             }
         }
     }
@@ -2592,6 +3054,7 @@ ember_provider::ember_provider(const spl::shared_ptr<std::vector<amcp::channel_c
     }
 
     monitor_thread_ = std::thread([this] { monitor_layer_changes(); });
+    meter_thread_   = std::thread([this] { meter_stream_loop(); });
 }
 
 ember_provider::~ember_provider()
@@ -2600,6 +3063,8 @@ ember_provider::~ember_provider()
     monitor_interval_cv_.notify_all();
     if (monitor_thread_.joinable())
         monitor_thread_.join();
+    if (meter_thread_.joinable())
+        meter_thread_.join();
 }
 
 void ember_provider::send_provider_state(const IO::client_connection<char>::ptr& client, bool online) const
@@ -2631,10 +3096,10 @@ void ember_provider::register_session(const std::shared_ptr<ember_session>& sess
     sessions_.push_back(session);
 }
 
-std::vector<IO::client_connection<char>::ptr> ember_provider::active_clients() const
+std::vector<std::shared_ptr<ember_session>> ember_provider::active_sessions() const
 {
-    std::vector<IO::client_connection<char>::ptr> clients;
-    std::set<const void*>                         seen_clients;
+    std::vector<std::shared_ptr<ember_session>> sessions;
+    std::set<const void*>                       seen_sessions;
 
     std::lock_guard<std::mutex> lock(sessions_mutex_);
 
@@ -2646,11 +3111,24 @@ std::vector<IO::client_connection<char>::ptr> ember_provider::active_clients() c
             continue;
         }
 
+        if (seen_sessions.insert(session.get()).second)
+            sessions.push_back(session);
+
+        ++it;
+    }
+
+    return sessions;
+}
+
+std::vector<IO::client_connection<char>::ptr> ember_provider::active_clients() const
+{
+    std::vector<IO::client_connection<char>::ptr> clients;
+    std::set<const void*>                         seen_clients;
+
+    for (const auto& session : active_sessions()) {
         const auto& client = session->client();
         if (client.get() != nullptr && seen_clients.insert(client.get()).second)
             clients.push_back(client);
-
-        ++it;
     }
 
     return clients;
@@ -2688,13 +3166,6 @@ void ember_provider::broadcast_monitor_interval_update(long interval_ms) const
 
 void ember_provider::monitor_layer_changes()
 {
-    live_snapshot_map_t previous_snapshot;
-    try {
-        previous_snapshot = collect_live_snapshot(channels_);
-    } catch (...) {
-        CASPAR_LOG_CURRENT_EXCEPTION();
-    }
-
     while (!stop_monitor_) {
         {
             std::unique_lock<std::mutex> lock(monitor_interval_mutex_);
@@ -2715,11 +3186,7 @@ void ember_provider::monitor_layer_changes()
             continue;
 
         try {
-            const auto current_snapshot = collect_live_snapshot(channels_);
-            if (current_snapshot != previous_snapshot) {
-                broadcast_directory_response();
-                previous_snapshot = current_snapshot;
-            }
+            broadcast_directory_response();
         } catch (...) {
             CASPAR_LOG_CURRENT_EXCEPTION();
         }
@@ -2731,6 +3198,99 @@ void ember_provider::broadcast_directory_response() const
     const auto clients = active_clients();
     for (const auto& client : clients)
         send_directory_response(client);
+}
+
+void ember_provider::meter_stream_loop()
+{
+    while (!stop_monitor_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(audio_meter_update_interval_ms));
+        if (stop_monitor_)
+            break;
+
+        const auto sessions = active_sessions();
+        if (sessions.empty())
+            continue;
+
+        bool any_subscribed = false;
+        for (const auto& session : sessions) {
+            if (!session->stream_subscriptions().empty()) {
+                any_subscribed = true;
+                break;
+            }
+        }
+
+        if (!any_subscribed)
+            continue;
+
+        try {
+            const auto snapshot = collect_audio_meter_snapshot(channels_);
+            for (const auto& session : sessions) {
+                const auto subscriptions = session->stream_subscriptions();
+                if (subscriptions.empty())
+                    continue;
+
+                auto packet = build_audio_meter_stream_packet(snapshot, subscriptions);
+                if (!packet.empty())
+                    session->client()->send(std::move(packet), true);
+            }
+        } catch (...) {
+            CASPAR_LOG_CURRENT_EXCEPTION();
+        }
+    }
+}
+
+bool ember_provider::handle_subscription_command(const std::vector<int>&              path,
+                                                 int                                  command_number,
+                                                 const std::shared_ptr<ember_session>& session) const
+{
+    if (!session)
+        return false;
+
+    if (command_number != libember::glow::CommandType::Subscribe &&
+        command_number != libember::glow::CommandType::Unsubscribe) {
+        return false;
+    }
+
+    bool matched = false;
+    for (const auto& channel : *channels_) {
+        const auto channel_index = channel.raw_channel->index();
+        const auto meter_count   = std::max(0, channel.raw_channel->stage()->video_format_desc().audio_channels);
+
+        for (const auto kind : {audio_meter_kind::raw_peak, audio_meter_kind::meter_percent, audio_meter_kind::dbfs}) {
+            for (int meter_index = 0; meter_index < meter_count; ++meter_index) {
+                if (!audio_meter_path_matches_prefix(path, kind, channel_index, meter_index))
+                    continue;
+
+                const auto stream_identifier = audio_meter_stream_identifier(kind, channel_index, meter_index);
+                if (command_number == libember::glow::CommandType::Subscribe)
+                    session->subscribe_stream(stream_identifier);
+                else
+                    session->unsubscribe_stream(stream_identifier);
+
+                matched = true;
+            }
+        }
+    }
+
+    if (matched && command_number == libember::glow::CommandType::Subscribe)
+        send_audio_meter_streams(session);
+
+    return matched;
+}
+
+void ember_provider::send_audio_meter_streams(const std::shared_ptr<ember_session>& session) const
+{
+    if (!session)
+        return;
+
+    const auto subscriptions = session->stream_subscriptions();
+    if (subscriptions.empty())
+        return;
+
+    const auto snapshot = collect_audio_meter_snapshot(channels_);
+    auto       packet   = build_audio_meter_stream_packet(snapshot, subscriptions);
+    if (!packet.empty())
+        session->client()->send(std::move(packet), true);
 }
 
 void ember_provider::handle_request(libember::dom::Node* request_root, const std::shared_ptr<ember_session>& session)
@@ -2746,6 +3306,11 @@ void ember_provider::handle_request(libember::dom::Node* request_root, const std
         send_directory_response(session->client());
         sent_response = true;
     }
+
+    std::vector<stream_command_request> stream_commands;
+    collect_stream_commands(*request_root, {}, stream_commands);
+    for (const auto& request : stream_commands)
+        sent_response = handle_subscription_command(request.path, request.command_number, session) || sent_response;
 
     std::vector<function_invocation_request> invocation_requests;
     collect_requests(*request_root, {}, invocation_requests);
@@ -2799,14 +3364,20 @@ void ember_provider::send_directory_response(const IO::client_connection<char>::
             media_clips = media_clips_;
         }
 
+        const auto runtime_system_snapshot = system_info_sampler_.sample();
+        const auto current_diagnostics_snapshot = diagnostics_snapshot();
         const auto live_snapshot = collect_live_snapshot(channels_);
+        const auto audio_snapshot = collect_audio_meter_snapshot(channels_);
         const auto state_update_interval_ms = monitor_interval_ms();
 
         client->send(build_directory_response(channels_,
                                               registry_,
                                               command_bridge_,
                                               state_update_interval_ms,
+                                              runtime_system_snapshot,
+                                              current_diagnostics_snapshot,
                                               live_snapshot,
+                                              audio_snapshot,
                                               media_clips,
                                               play_controls,
                                               loadbg_controls,

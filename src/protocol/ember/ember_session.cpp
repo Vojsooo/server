@@ -14,6 +14,7 @@
 #include "ember_session.h"
 
 #include <mutex>
+#include <set>
 
 namespace caspar { namespace protocol { namespace ember {
 
@@ -27,6 +28,7 @@ struct ember_session_capture_state
     IO::client_connection<char>::ptr client;
     mutable std::mutex               mutex;
     std::wstring                     output;
+    std::set<int>                    stream_subscriptions;
 };
 
 namespace {
@@ -82,6 +84,30 @@ std::wstring ember_session::take_amcp_output() const
     auto                        output = std::move(capture_state_->output);
     capture_state_->output.clear();
     return output;
+}
+
+void ember_session::subscribe_stream(int stream_identifier) const
+{
+    std::lock_guard<std::mutex> lock(capture_state_->mutex);
+    capture_state_->stream_subscriptions.insert(stream_identifier);
+}
+
+void ember_session::unsubscribe_stream(int stream_identifier) const
+{
+    std::lock_guard<std::mutex> lock(capture_state_->mutex);
+    capture_state_->stream_subscriptions.erase(stream_identifier);
+}
+
+void ember_session::clear_stream_subscriptions() const
+{
+    std::lock_guard<std::mutex> lock(capture_state_->mutex);
+    capture_state_->stream_subscriptions.clear();
+}
+
+std::vector<int> ember_session::stream_subscriptions() const
+{
+    std::lock_guard<std::mutex> lock(capture_state_->mutex);
+    return std::vector<int>(capture_state_->stream_subscriptions.begin(), capture_state_->stream_subscriptions.end());
 }
 
 }}} // namespace caspar::protocol::ember

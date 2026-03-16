@@ -48,6 +48,7 @@
 #include <protocol/amcp/AMCPProtocolStrategy.h>
 #include <protocol/amcp/amcp_command_repository.h>
 #include <protocol/amcp/amcp_shared.h>
+#include <protocol/ember/ember_diagnostics.h>
 #include <protocol/ember/ember_protocol_strategy.h>
 #include <protocol/ember/ember_provider.h>
 #include <protocol/osc/client.h>
@@ -159,6 +160,7 @@ struct server::impl
         , shutdown_server_now_(std::move(shutdown_server_now))
     {
         caspar::core::diagnostics::osd::register_sink();
+        caspar::protocol::ember::register_diagnostics_sink();
     }
 
     void start()

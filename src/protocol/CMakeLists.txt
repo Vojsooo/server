@@ -18,10 +18,12 @@ set(SOURCES
 		osc/client.cpp
 
 		ember/ember_command_bridge.cpp
+		ember/ember_diagnostics.cpp
 		ember/ember_protocol_strategy.cpp
 		ember/ember_provider.cpp
 		ember/ember_registry.cpp
 		ember/ember_session.cpp
+		ember/ember_system_info.cpp
 
 		util/AsyncEventServer.cpp
 		util/lock_container.cpp
@@ -53,10 +55,12 @@ set(HEADERS
 		osc/client.h
 
 		ember/ember_command_bridge.h
+		ember/ember_diagnostics.h
 		ember/ember_protocol_strategy.h
 		ember/ember_provider.h
 		ember/ember_registry.h
 		ember/ember_session.h
+		ember/ember_system_info.h
 
 		util/AsyncEventServer.h
 		util/ClientInfo.h

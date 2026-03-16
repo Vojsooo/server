@@ -12,6 +12,7 @@
 #pragma once
 
 #include "ember_command_bridge.h"
+#include "ember_system_info.h"
 #include "ember_registry.h"
 
 #include "../amcp/amcp_command_repository.h"
@@ -106,13 +107,19 @@ class ember_provider final
 
   private:
     void register_session(const std::shared_ptr<ember_session>& session);
+    std::vector<std::shared_ptr<ember_session>> active_sessions() const;
     std::vector<IO::client_connection<char>::ptr> active_clients() const;
     void monitor_layer_changes();
+    void meter_stream_loop();
     long monitor_interval_ms() const;
     void set_monitor_interval(std::chrono::milliseconds interval);
     void broadcast_monitor_interval_update(long interval_ms) const;
     void broadcast_directory_response() const;
     void send_directory_response(const IO::client_connection<char>::ptr& client) const;
+    bool handle_subscription_command(const std::vector<int>&              path,
+                                     int                                  command_number,
+                                     const std::shared_ptr<ember_session>& session) const;
+    void send_audio_meter_streams(const std::shared_ptr<ember_session>& session) const;
     bool handle_parameter_write(const std::vector<int>&              path,
                                 const libember::glow::Value&         value,
                                 const std::shared_ptr<ember_session>& session);
@@ -143,7 +150,9 @@ class ember_provider final
     std::chrono::milliseconds                           monitor_interval_;
     bool                                                monitor_interval_updated_ = false;
     mutable std::mutex                                  configuration_mutex_;
+    mutable ember_system_info_sampler                   system_info_sampler_;
     std::thread                                         monitor_thread_;
+    std::thread                                         meter_thread_;
 };
 
 }}} // namespace caspar::protocol::ember

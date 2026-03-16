@@ -17,7 +17,9 @@
 #include <common/memory.h>
 
 #include <memory>
+#include <set>
 #include <string>
+#include <vector>
 
 namespace caspar { namespace protocol { namespace ember {
 
@@ -31,6 +33,10 @@ class ember_session final
     const IO::client_connection<char>::ptr& client() const;
     IO::ClientInfoPtr                       amcp_client() const;
     std::wstring                           take_amcp_output() const;
+    void                                   subscribe_stream(int stream_identifier) const;
+    void                                   unsubscribe_stream(int stream_identifier) const;
+    void                                   clear_stream_subscriptions() const;
+    std::vector<int>                       stream_subscriptions() const;
 
   private:
     std::shared_ptr<ember_session_capture_state> capture_state_;
